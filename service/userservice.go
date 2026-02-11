@@ -233,3 +233,23 @@ func SearchFriends(c *gin.Context){
 	// })
 	utils.RespOkList(c.Writer,users,len(users))
 }
+
+func AddFriend(c *gin.Context){
+	userId,_:=strconv.Atoi(c.Request.FormValue("userId"))
+	targetId,_:=strconv.Atoi(c.Request.FormValue("targetId"))
+	code:=models.AddFriend(uint(userId),uint(targetId))
+	if code == 0{
+			utils.RespOk(c.Writer,code,"添加成功")
+
+	}else if code==1{
+		utils.RespFail(c.Writer,"不能添加自己")
+	}else if code==-2{
+		utils.RespFail(c.Writer,"没有找到此用户")
+	}else if code==-3{
+		utils.RespFail(c.Writer,"好友ID不能为空")
+	}else if code==2{
+		utils.RespFail(c.Writer,"不能添加已经添加过的好友")
+	}else{
+		utils.RespFail(c.Writer,"添加失败")
+	}
+}
