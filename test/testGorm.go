@@ -21,11 +21,12 @@ func main() {
 	}
 
 	// 迁移 schema
-	db.AutoMigrate(&models.UserBasic{})
+	//db.AutoMigrate(&models.UserBasic{})
 	//db.AutoMigrate(&models.UserBasic{})
 	//db.AutoMigrate(&models.Message{})
-	db.AutoMigrate(&models.GroupBasic{})
-	db.AutoMigrate(&models.Contact{})
+	//db.AutoMigrate(&models.GroupBasic{})
+	db.AutoMigrate(&models.Community{})
+	//db.AutoMigrate(&models.Contact{})
 
 	// Create
 	// user := &models.UserBasic{}

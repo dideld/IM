@@ -253,3 +253,43 @@ func AddFriend(c *gin.Context){
 		utils.RespFail(c.Writer,"添加失败")
 	}
 }
+//新建群
+func CreateCommunity(c *gin.Context){
+	ownerId,_:=strconv.Atoi(c.Request.FormValue("ownerId"))
+	Name:=c.Request.FormValue("name")
+	community :=models.Community{}
+	community.OwnerId=uint(ownerId)
+	community.Name = Name
+	code,msg :=models.CreateCommunity(community)
+
+	if code == 0{
+		utils.RespOk(c.Writer,code,msg)
+	}else {
+		utils.RespFail(c.Writer, msg)
+	}
+
+}
+//加载群
+func LoadCommunity(c *gin.Context){
+	ownerId,_:=strconv.Atoi(c.Request.FormValue("ownerId"))
+	data,msg :=models.LoadCommunity(uint(ownerId))
+
+	if len(data)!=0{
+		utils.RespList(c.Writer,0,data,msg)
+	}else{
+		utils.RespFail(c.Writer,msg)
+	}
+
+}
+
+func JoinGroup( c *gin.Context){
+	userId,_:=strconv.Atoi(c.Request.FormValue("userId"))
+	comId:=c.Request.FormValue("comId")
+
+	data,msg:=models.JoinGroup(uint(userId),comId)
+	if data ==0{
+		utils.RespOk(c.Writer,data,msg)
+	}else{
+		utils.RespFail(c.Writer,msg)
+	}
+}
