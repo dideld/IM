@@ -206,6 +206,15 @@ func SendMsg(c *gin.Context){
 	}(ws)
 	MsgHandler(ws,c)
 }
+func RedisMsg(c *gin.Context){
+	userIdA, _ := strconv.Atoi(c.PostForm("userIdA"))
+	userIdB, _ := strconv.Atoi(c.PostForm("userIdB"))
+	start, _ := strconv.Atoi(c.PostForm("start"))
+	end, _ := strconv.Atoi(c.PostForm("end"))
+	isRev, _ := strconv.ParseBool(c.PostForm("isRev"))
+	res := models.RedisMsg(int64(userIdA), int64(userIdB), int64(start), int64(end), isRev)
+	utils.RespOkList(c.Writer, "ok", res)
+}
 func MsgHandler(ws *websocket.Conn,c *gin.Context){
 	msg,err:=utils.Subscribe(c,utils.PublishKey)
 	if err!=nil{

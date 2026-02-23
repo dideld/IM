@@ -37,6 +37,8 @@ func Router() *gin.Engine{
 	r.GET("/user/sendUserMsg",service.SendUserMsg)
 	//上传文件
 	r.POST("/attach/upload",service.Upload)
+	//读取消息
+	r.POST("/user/redisMsg", service.RedisMsg)
 	//添加好友
 	r.POST("/contact/addfriend",service.AddFriend)
 	//创建群

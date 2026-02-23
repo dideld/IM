@@ -1,16 +1,21 @@
 package models
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"strconv"
 	"sync"
-	"gopkg.in/fatih/set.v0"
-	"github.com/gorilla/websocket"
-	"gorm.io/gorm"
+	"time"
 	"webapp/utils"
+
+	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
+	"github.com/spf13/viper"
+	"gopkg.in/fatih/set.v0"
+	"gorm.io/gorm"
 )
 
 type Message struct {
@@ -20,6 +25,8 @@ type Message struct {
 	Type int //群聊、私聊、广播
 	Media int //消息类型  文字、表情包、图片、音频
 	Content string //消息内容
+	CreateTime uint64 //创建时间
+	ReadTime   uint64 //读取时间
 	Pic string 
 	Url string
 	Desc string
@@ -30,10 +37,14 @@ func (table *Message)TableName()string{
 	return "message"
 }
 
-type Node struct{
-	Conn *websocket.Conn
-	DataQueue chan []byte
-	GroupSets set.Interface
+	type Node struct {
+	Conn          *websocket.Conn //连接
+	Addr          string          //客户端地址
+	FirstTime     uint64          //首次连接时间
+	HeartbeatTime uint64          //心跳时间
+	LoginTime     uint64          //登录时间
+	DataQueue     chan []byte     //消息
+	GroupSets     set.Interface   //好友 / 群
 }
 //映射关系
 var clientMap map[int64]*Node =make(map[int64]*Node,0)
@@ -118,7 +129,7 @@ func init(){
 func udpSendProc(){
 	con,err:=net.DialUDP("udp",nil,&net.UDPAddr{
 		IP: net.IPv4(192,168,115,1),
-		Port:3000,
+		Port: viper.GetInt("port.udp"),
 	})
 	
 	if err!=nil{
@@ -141,7 +152,7 @@ func udpSendProc(){
 func udpRevProc(){
 	con,err:=net.ListenUDP("udp",&net.UDPAddr{
 		IP: net.IPv4zero,
-		Port:3000,
+		Port: viper.GetInt("port.udp"),
 
 	})
 	if err!=nil{
@@ -172,19 +183,57 @@ func dispatch(data []byte){
 	 case 1:
 		fmt.Println("dispatch  data :", string(data))
 		sendMsg(int64(msg.TargetId),data,)   //私信
-	// case 2:sendGroupMsg()   //群发
+	 case 2:
+		sendGroupMsg(int64(msg.TargetId), data)   //群发
 	// case 3:sendAllMsg()        //广播
 	// case 4:                //其他
 
 	}
 }
-func sendMsg(userId int64,msg []byte){
+func sendMsg(userId int64, msg []byte) {
+
 	rwLock.RLock()
-	node,ok:=clientMap[userId]
-	defer rwLock.RUnlock()
-	if ok{
-		node.DataQueue<-msg
+	node, ok := clientMap[userId]
+	rwLock.RUnlock()
+
+	jsonMsg := Message{}
+	json.Unmarshal(msg, &jsonMsg)
+
+	ctx := context.Background()
+	targetIdStr := strconv.Itoa(int(userId))
+	userIdStr := strconv.Itoa(int(jsonMsg.UserId))
+	//设置时间戳
+	jsonMsg.CreateTime = uint64(time.Now().Unix())
+	r, err := utils.Red.Get(ctx, "online_"+userIdStr).Result()
+	if err != nil {
+		fmt.Println(err)
 	}
+	if r != "" {
+		if ok {
+			fmt.Println("sendMsg >>> userID: ", userId, "  msg:", string(msg))
+			node.DataQueue <- msg
+		}
+	}
+	var key string
+	if userId > int64(jsonMsg.UserId) {
+		key = "msg_" + userIdStr + "_" + targetIdStr
+	} else {
+		key = "msg_" + targetIdStr + "_" + userIdStr
+	}
+	res, err := utils.Red.ZRevRange(ctx, key, 0, -1).Result()
+	if err != nil {
+		fmt.Println(err)
+	}
+	score := float64(cap(res)) + 1
+	ress, e := utils.Red.ZAdd(ctx, key, redis.Z{
+    Score:  score,
+    Member: msg,
+}).Result() //jsonMsg
+	//res, e := utils.Red.Do(ctx, "zadd", key, 1, jsonMsg).Result() //备用 后续拓展 记录完整msg
+	if e != nil {
+		fmt.Println(e)
+	}
+	fmt.Println(ress)
 }
 
 //加入群聊
@@ -207,4 +256,86 @@ func JoinGroup(userId uint, comId string) (int, string) {
 		utils.DB.Create(&contact)
 		return 0, "加群成功"
 	}
+}
+
+	//获取缓存里面的消息
+func RedisMsg(userIdA int64, userIdB int64, start int64, end int64, isRev bool) []string {
+	//node, ok := clientMap[userIdA]
+	//jsonMsg := Message{}
+	//json.Unmarshal(msg, &jsonMsg)
+	ctx := context.Background()
+	userIdStr := strconv.Itoa(int(userIdA))
+	targetIdStr := strconv.Itoa(int(userIdB))
+	var key string
+	if userIdA > userIdB {
+		key = "msg_" + targetIdStr + "_" + userIdStr
+	} else {
+		key = "msg_" + userIdStr + "_" + targetIdStr
+	}
+	  exists, _ := utils.Red.Exists(ctx, key).Result()
+    fmt.Printf("Key: %s, Exists: %v\n", key, exists)
+    
+    // 调试：查看集合大小
+    size, _ := utils.Red.ZCard(ctx, key).Result()
+    fmt.Printf("集合大小: %d\n", size)
+
+	var rels []string
+	var err error
+	if isRev {
+		rels, err = utils.Red.ZRange(ctx, key, start, end).Result()
+	} else {
+		rels, err = utils.Red.ZRevRange(ctx, key, start, end).Result()
+	}
+	if err != nil {
+		fmt.Println(err) //没有找到
+	}
+	// 发送推送消息
+	/**
+	// 后台通过websoket 推送消息
+	for _, val := range rels {
+		fmt.Println("sendMsg >>> userID: ", userIdA, "  msg:", val)
+		node.DataQueue <- []byte(val)
+	}**/
+	return rels
+}
+func sendGroupMsg(targetId int64,msg []byte ){
+	fmt.Println("开始群发消息")
+	userIds :=SearchUserByGroupId(uint(targetId))
+	for i:=0;i<len(userIds);i++{
+		//排除给自己的
+		if targetId!= int64(userIds[i]){
+			sendMsg(int64(userIds[i]),msg)
+		}
+	}
+}
+	//需要重写此方法才能完整的msg转byte[]
+func (msg Message) MarshalBinary() ([]byte, error) {
+	return json.Marshal(msg)
+}
+func (node *Node) IsHeartbeatTimeOut(currentTime uint64) (timeout bool) {
+	if node.HeartbeatTime+viper.GetUint64("timeout.HeartbeatMaxTime") <= currentTime {
+		fmt.Println("心跳超时。。。自动下线", node)
+		timeout = true
+	}
+	return
+}
+//清理超时连接
+func CleanConnection(param interface{}) (result bool) {
+	result = true
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("cleanConnection err", r)
+		}
+	}()
+	//fmt.Println("定时任务,清理超时连接 ", param)
+	//node.IsHeartbeatTimeOut()
+	currentTime := uint64(time.Now().Unix())
+	for i := range clientMap {
+		node := clientMap[i]
+		if node.IsHeartbeatTimeOut(currentTime) {
+			fmt.Println("心跳超时..... 关闭连接：", node)
+			node.Conn.Close()
+		}
+	}
+	return result
 }
