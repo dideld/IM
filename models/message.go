@@ -103,15 +103,28 @@ func sendProc(node *Node){
 		}
 	}
 }
-func recvProc(node *Node){
-	for{
-		_,data,err:=node.Conn.ReadMessage()
-		if err!=nil{
+	func recvProc(node *Node) {
+	for {
+		_, data, err := node.Conn.ReadMessage()
+		if err != nil {
 			fmt.Println(err)
 			return
 		}
-		broadMsg(data)
-		fmt.Println("[ws] <<<<<",string(data))
+		msg := Message{}
+		err = json.Unmarshal(data, &msg)
+		if err != nil {
+			fmt.Println(err)
+		}
+		//心跳检测 msg.Media == -1 || msg.Type == 3
+		if msg.Type == 3 {
+			currentTime := uint64(time.Now().Unix())
+			node.Heartbeat(currentTime)
+		} else {
+			dispatch(data)
+			broadMsg(data) //todo 将消息广播到局域网
+			fmt.Println("[ws] recvProc <<<<< ", string(data))
+		}
+
 	}
 }
 var udpsendChan chan []byte=make(chan []byte,1024)
@@ -260,7 +273,9 @@ func JoinGroup(userId uint, comId string) (int, string) {
 
 	//获取缓存里面的消息
 func RedisMsg(userIdA int64, userIdB int64, start int64, end int64, isRev bool) []string {
+	rwLock.RLock()
 	//node, ok := clientMap[userIdA]
+	rwLock.RUnlock()
 	//jsonMsg := Message{}
 	//json.Unmarshal(msg, &jsonMsg)
 	ctx := context.Background()
@@ -272,12 +287,8 @@ func RedisMsg(userIdA int64, userIdB int64, start int64, end int64, isRev bool) 
 	} else {
 		key = "msg_" + userIdStr + "_" + targetIdStr
 	}
-	  exists, _ := utils.Red.Exists(ctx, key).Result()
-    fmt.Printf("Key: %s, Exists: %v\n", key, exists)
-    
-    // 调试：查看集合大小
-    size, _ := utils.Red.ZCard(ctx, key).Result()
-    fmt.Printf("集合大小: %d\n", size)
+	//key = "msg_" + userIdStr + "_" + targetIdStr
+	//rels, err := utils.Red.ZRevRange(ctx, key, 0, 10).Result()  //根据score倒叙
 
 	var rels []string
 	var err error
@@ -298,6 +309,7 @@ func RedisMsg(userIdA int64, userIdB int64, start int64, end int64, isRev bool) 
 	}**/
 	return rels
 }
+
 func sendGroupMsg(targetId int64,msg []byte ){
 	fmt.Println("开始群发消息")
 	userIds :=SearchUserByGroupId(uint(targetId))
@@ -338,4 +350,9 @@ func CleanConnection(param interface{}) (result bool) {
 		}
 	}
 	return result
+}
+	//更新用户心跳
+func (node *Node) Heartbeat(currentTime uint64) {
+	node.HeartbeatTime = currentTime
+	return
 }
