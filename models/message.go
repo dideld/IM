@@ -21,7 +21,7 @@ import (
 type Message struct {
 	gorm.Model
 	UserId uint //发送者
-	TargetId uint //接收者
+	TargetId int64 //接收者
 	Type int //群聊、私聊、广播
 	Media int //消息类型  文字、表情包、图片、音频
 	Content string //消息内容

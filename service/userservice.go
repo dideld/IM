@@ -113,10 +113,11 @@ func DeleteUser(c *gin.Context){
 // @param name formData string flase "name"
 // @param password formData string flase "password"
 // @param phone formData string flase "phone"
+// @param avator formData string flase "icon"
 // @param email formData string flase "email"
 // @Produce json  
 // @Success 200 {string} json{"code"，"message"} // 修改返回类型
-// @Router /user/updateUser [put]
+// @Router /user/updateUser [post]
 func UpdateUser(c *gin.Context){
 	user:=models.UserBasic{}
 	id,_:=strconv.Atoi(c.PostForm("id"))
@@ -124,6 +125,7 @@ func UpdateUser(c *gin.Context){
 	user.Name=c.PostForm("name")
 	user.PassWord=c.PostForm("password")
 	user.Phone=c.PostForm("phone")
+	user.Avatar=c.PostForm("icon")
 	user.Email=c.PostForm("email")
 	models.UpdateUser(user)
 	_,err:=govalidator.ValidateStruct(user)
@@ -266,9 +268,13 @@ func AddFriend(c *gin.Context){
 func CreateCommunity(c *gin.Context){
 	ownerId,_:=strconv.Atoi(c.Request.FormValue("ownerId"))
 	Name:=c.Request.FormValue("name")
+	icon:=c.Request.FormValue("icon")
+	desc:=c.Request.FormValue("desc")
 	community :=models.Community{}
 	community.OwnerId=uint(ownerId)
 	community.Name = Name
+	community.Img=icon
+	community.Desc=desc
 	code,msg :=models.CreateCommunity(community)
 
 	if code == 0{
