@@ -1,0 +1,32 @@
+<div id="tabbar-friends" 
+     class="mui-control-content" 
+     v-show="win=='friends'">
+
+    <header class="mui-bar mui-bar-nav">
+        <h1 class="mui-title">好友列表</h1>
+    </header>
+
+    <ul class="mui-table-view">
+
+        <li class="mui-table-view-cell mui-media"
+            v-for="item in friendlist"
+            :key="item.Id">
+
+            <img class="mui-media-object mui-pull-left"
+                 :src="item.icon || '/asset/images/avatar0.png'">
+
+            <div class="mui-media-body">
+                <span v-text="item.name"></span>
+                <p class="mui-ellipsis"><span v-text="item.memo"></span></p>
+            </div>
+
+            <button class="mui-btn mui-btn-danger mui-btn-outlined"
+                    style="float:right"
+                    @click.stop="removefriend(item.Id,item.name)">
+                删除
+            </button>
+
+        </li>
+
+    </ul>
+</div>

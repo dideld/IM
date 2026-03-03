@@ -37,7 +37,7 @@ func (table *Message)TableName()string{
 	return "message"
 }
 
-	type Node struct {
+type Node struct {
 	Conn          *websocket.Conn //连接
 	Addr          string          //客户端地址
 	FirstTime     uint64          //首次连接时间
@@ -57,10 +57,6 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 	query:=request.URL.Query()
 	Id:=query.Get("userId")
 	userId,_:=strconv.ParseInt(Id,10,64)
-	//token:=query.Get("token")
-	//mtype:=query.Get("mtype")
-	// targetId:=query.Get("targetId")
-	// context:=query.Get("context")
 	isvalida:=true
 	conn,err:=(&websocket.Upgrader{
 		//token校验
@@ -81,7 +77,10 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 	//3.用户关系
 	//4.userid和node绑定并加锁
 	rwLock.Lock()
-	clientMap[userId]=node
+	if oldNode, ok := clientMap[userId]; ok {
+		oldNode.Conn.Close()  // 关闭旧连接
+	}
+	clientMap[userId] = node
 	rwLock.Unlock()
 
 	//5.完成发送逻辑
@@ -103,7 +102,7 @@ func sendProc(node *Node){
 		}
 	}
 }
-	func recvProc(node *Node) {
+func recvProc(node *Node) {
 	for {
 		_, data, err := node.Conn.ReadMessage()
 		if err != nil {
@@ -271,13 +270,8 @@ func JoinGroup(userId uint, comId string) (int, string) {
 	}
 }
 
-	//获取缓存里面的消息
+//获取缓存里面的消息
 func RedisMsg(userIdA int64, userIdB int64, start int64, end int64, isRev bool) []string {
-	rwLock.RLock()
-	//node, ok := clientMap[userIdA]
-	rwLock.RUnlock()
-	//jsonMsg := Message{}
-	//json.Unmarshal(msg, &jsonMsg)
 	ctx := context.Background()
 	userIdStr := strconv.Itoa(int(userIdA))
 	targetIdStr := strconv.Itoa(int(userIdB))
@@ -287,8 +281,6 @@ func RedisMsg(userIdA int64, userIdB int64, start int64, end int64, isRev bool) 
 	} else {
 		key = "msg_" + userIdStr + "_" + targetIdStr
 	}
-	//key = "msg_" + userIdStr + "_" + targetIdStr
-	//rels, err := utils.Red.ZRevRange(ctx, key, 0, 10).Result()  //根据score倒叙
 
 	var rels []string
 	var err error
@@ -300,13 +292,6 @@ func RedisMsg(userIdA int64, userIdB int64, start int64, end int64, isRev bool) 
 	if err != nil {
 		fmt.Println(err) //没有找到
 	}
-	// 发送推送消息
-	/**
-	// 后台通过websoket 推送消息
-	for _, val := range rels {
-		fmt.Println("sendMsg >>> userID: ", userIdA, "  msg:", val)
-		node.DataQueue <- []byte(val)
-	}**/
 	return rels
 }
 

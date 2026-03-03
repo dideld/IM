@@ -40,7 +40,10 @@ func Router() *gin.Engine{
 	//读取消息
 	r.POST("/user/redisMsg", service.RedisMsg)
 	//添加好友
+	//r.GET("/contact/loadfriends",service.LoadFriends)
 	r.POST("/contact/addfriend",service.AddFriend)
+	//删除好友
+	r.POST("/contact/deletefriend",service.DeleteFriend)
 	//创建群
 	r.POST("/contact/createCommunity",service.CreateCommunity)
 	//群列表

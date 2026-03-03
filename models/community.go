@@ -14,17 +14,37 @@ type Community struct {
 	Desc string
 
 }
-func CreateCommunity(c Community) (int,string){
-	if len(c.Name)==0{
-		return -1,"群名称不能为空"
+func CreateCommunity(community Community) (int,string){
+	tx := utils.DB.Begin()
+	//事务一旦开始，不论什么异常最终都会 Rollback
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
+	if len(community.Name) == 0 {
+		return -1, "群名称不能为空"
 	}
-	if c.OwnerId==0{
-		return -1,"请先登录"
+	if community.OwnerId == 0 {
+		return -1, "请先登录"
 	}
-	if err:=utils.DB.Create(&c).Error;err!=nil{
-		return -1,"建群失败"
+	if err := utils.DB.Create(&community).Error; err != nil {
+		fmt.Println(err)
+		tx.Rollback()
+		return -1, "建群失败"
 	}
-	return 0,"建群成功"
+	contact := Contact{}
+	contact.OwnerId = community.OwnerId
+	contact.TargetId = community.ID
+	contact.Type = 2 //群关系
+	if err := utils.DB.Create(&contact).Error; err != nil {
+		tx.Rollback()
+		return -1, "添加群关系失败"
+	}
+
+	tx.Commit()
+	return 0, "建群成功"
 }
 
 // func LoadCommunity(ownerId uint)([] *Community,string){

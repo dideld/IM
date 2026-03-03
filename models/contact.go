@@ -84,3 +84,43 @@ func AddFriend(userId uint,targetId uint) int{
 	}
 	return -3
 }
+//删除好友
+func DeleteFriend(ownerId uint,targetId uint) (int,string){
+	if ownerId == 0 || targetId == 0 {
+		return -1, "参数错误"
+	}
+	contact0:=Contact{}
+	if err:=utils.DB.Where("owner_id= ? and target_id = ? and type = 1",ownerId,targetId).Delete(&contact0).Error;err!=nil{
+		fmt.Println(err)
+		return -1,""
+	}
+	if err:=utils.DB.Where("owner_id= ? and target_id = ? and type = 1",targetId,ownerId).Delete(&contact0).Error;err!=nil{
+		fmt.Println(err)
+		return -1,""
+	}
+
+	return 0, "删除成功"
+}
+//加载好友
+func LoadFriends(userId uint) ([]UserBasic,string){
+
+	var contacts []Contact
+	var users []UserBasic
+
+	utils.DB.Where("owner_id = ? AND type = 1", userId).
+		Find(&contacts)
+
+	if len(contacts) == 0 {
+		return users,"暂无好友"
+	}
+
+	var ids []uint
+	for _,v := range contacts{
+		ids = append(ids,v.TargetId)
+	}
+
+	utils.DB.Where("id IN ?", ids).
+		Find(&users)
+
+	return users,"加载成功"
+}

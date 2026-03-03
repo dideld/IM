@@ -248,6 +248,7 @@ func SearchFriends(c *gin.Context){
 func AddFriend(c *gin.Context){
 	userId,_:=strconv.Atoi(c.Request.FormValue("userId"))
 	targetId,_:=strconv.Atoi(c.Request.FormValue("targetId"))
+	
 	code:=models.AddFriend(uint(userId),uint(targetId))
 	if code == 0{
 			utils.RespOk(c.Writer,code,"添加成功")
@@ -278,10 +279,13 @@ func CreateCommunity(c *gin.Context){
 	code,msg :=models.CreateCommunity(community)
 
 	if code == 0{
+		// models.JoinGroup(uint(ownerId),)
 		utils.RespOk(c.Writer,code,msg)
+
 	}else {
 		utils.RespFail(c.Writer, msg)
 	}
+
 
 }
 //加载群
@@ -304,6 +308,29 @@ func JoinGroup( c *gin.Context){
 	data,msg:=models.JoinGroup(uint(userId),comId)
 	if data ==0{
 		utils.RespOk(c.Writer,data,msg)
+	}else{
+		utils.RespFail(c.Writer,msg)
+	}
+}
+
+func DeleteFriend(c *gin.Context){
+	ownerId,_:=strconv.Atoi(c.Request.FormValue("ownerId"))
+	targetId,_:=strconv.Atoi(c.Request.FormValue("targetId"))
+	data, msg := models.DeleteFriend(uint(ownerId), uint(targetId))
+
+	if data == 0 {
+		utils.RespOk(c.Writer, data, msg)
+	} else {
+		utils.RespFail(c.Writer, msg)
+	}
+}
+func LoadFriends( c *gin.Context){
+	userId,_ := strconv.Atoi(c.Query("userId"))
+
+	data,msg := models.LoadFriends(uint(userId))
+
+	if len(data) != 0 {
+		utils.RespList(c.Writer,0,data,msg)
 	}else{
 		utils.RespFail(c.Writer,msg)
 	}
