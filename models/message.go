@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"sync"
 	"time"
 	"webapp/utils"
 
@@ -38,19 +37,21 @@ func (table *Message)TableName()string{
 }
 
 type Node struct {
+	UserId        int64
 	Conn          *websocket.Conn //连接
-	Addr          string          //客户端地址
 	FirstTime     uint64          //首次连接时间
 	HeartbeatTime uint64          //心跳时间
 	LoginTime     uint64          //登录时间
 	DataQueue     chan []byte     //消息
 	GroupSets     set.Interface   //好友 / 群
 }
-//映射关系
-var clientMap map[int64]*Node =make(map[int64]*Node,0)
 
-//读写锁
-var rwLock sync.RWMutex
+var WsHub = NewHub()
+// //映射关系
+// var clientMap map[int64]*Node =make(map[int64]*Node,0)
+
+// //读写锁
+// var rwLock sync.RWMutex
 
 func Chat(writer http.ResponseWriter,request *http.Request){
 	//1.获取参数并校验合法性
@@ -69,19 +70,15 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 		return 
 	}
 	//2.获取conn
-	node:=&Node{
-		Conn: conn,
-		DataQueue: make(chan []byte,50),
-		GroupSets:set.New(set.ThreadSafe),
-	}
-	//3.用户关系
 	//4.userid和node绑定并加锁
-	rwLock.Lock()
-	if oldNode, ok := clientMap[userId]; ok {
-		oldNode.Conn.Close()  // 关闭旧连接
+		node := &Node{
+		UserId:    userId,
+		Conn:      conn,
+		DataQueue: make(chan []byte, 256),
+		GroupSets: set.New(set.ThreadSafe),
+		HeartbeatTime: uint64(time.Now().Unix()),
 	}
-	clientMap[userId] = node
-	rwLock.Unlock()
+	WsHub.register <- node
 
 	//5.完成发送逻辑
 	go sendProc(node)
@@ -103,64 +100,41 @@ func sendProc(node *Node){
 	}
 }
 func recvProc(node *Node) {
+	defer func() {
+		WsHub.unregister <- node
+		node.Conn.Close()
+	}()
+
 	for {
 		_, data, err := node.Conn.ReadMessage()
 		if err != nil {
-			fmt.Println(err)
-			return
+			fmt.Println("read error:", err)
+			break
 		}
+
 		msg := Message{}
 		err = json.Unmarshal(data, &msg)
 		if err != nil {
 			fmt.Println(err)
-		}
-		//心跳检测 msg.Media == -1 || msg.Type == 3
-		if msg.Type == 3 {
-			currentTime := uint64(time.Now().Unix())
-			node.Heartbeat(currentTime)
-		} else {
-			dispatch(data)
-			broadMsg(data) //todo 将消息广播到局域网
-			fmt.Println("[ws] recvProc <<<<< ", string(data))
+			continue
 		}
 
+		// 心跳
+		if msg.Type == 3 {
+			node.Heartbeat(uint64(time.Now().Unix()))
+			continue
+		}
+
+		dispatch(data)
 	}
 }
-var udpsendChan chan []byte=make(chan []byte,1024)
-func broadMsg(data []byte){
-	udpsendChan <-data
 
-}
 func init(){
-	go udpSendProc()
 	go udpRevProc() 
+	go WsHub.Run()
 	fmt.Println("init goroutine:------------")
 }
 
-//完成udp数据发送携程
-func udpSendProc(){
-	con,err:=net.DialUDP("udp",nil,&net.UDPAddr{
-		IP: net.IPv4(192,168,115,1),
-		Port: viper.GetInt("port.udp"),
-	})
-	
-	if err!=nil{
-		fmt.Println(err)
-		return 
-	}
-	defer con.Close()
-	for{
-		select{
-		case data:=<-udpsendChan:
-			fmt.Println("udpSendProc  data :", string(data))
-			_,err:=con.Write(data)
-			if err!=nil{
-				fmt.Println(err)
-				return 
-			}
-		}
-	}
-}
 func udpRevProc(){
 	con,err:=net.ListenUDP("udp",&net.UDPAddr{
 		IP: net.IPv4zero,
@@ -204,10 +178,6 @@ func dispatch(data []byte){
 }
 func sendMsg(userId int64, msg []byte) {
 
-	rwLock.RLock()
-	node, ok := clientMap[userId]
-	rwLock.RUnlock()
-
 	jsonMsg := Message{}
 	json.Unmarshal(msg, &jsonMsg)
 
@@ -216,16 +186,6 @@ func sendMsg(userId int64, msg []byte) {
 	userIdStr := strconv.Itoa(int(jsonMsg.UserId))
 	//设置时间戳
 	jsonMsg.CreateTime = uint64(time.Now().Unix())
-	r, err := utils.Red.Get(ctx, "online_"+userIdStr).Result()
-	if err != nil {
-		fmt.Println(err)
-	}
-	if r != "" {
-		if ok {
-			fmt.Println("sendMsg >>> userID: ", userId, "  msg:", string(msg))
-			node.DataQueue <- msg
-		}
-	}
 	var key string
 	if userId > int64(jsonMsg.UserId) {
 		key = "msg_" + userIdStr + "_" + targetIdStr
@@ -246,6 +206,10 @@ func sendMsg(userId int64, msg []byte) {
 		fmt.Println(e)
 	}
 	fmt.Println(ress)
+	WsHub.send <- &SendRequest{
+		userID: userId,
+		data:   msg,
+	}
 }
 
 //加入群聊
@@ -309,33 +273,10 @@ func sendGroupMsg(targetId int64,msg []byte ){
 func (msg Message) MarshalBinary() ([]byte, error) {
 	return json.Marshal(msg)
 }
-func (node *Node) IsHeartbeatTimeOut(currentTime uint64) (timeout bool) {
-	if node.HeartbeatTime+viper.GetUint64("timeout.HeartbeatMaxTime") <= currentTime {
-		fmt.Println("心跳超时。。。自动下线", node)
-		timeout = true
-	}
-	return
+func (node *Node) IsHeartbeatTimeOut(currentTime uint64)  bool {
+	 return currentTime-node.HeartbeatTime > uint64(viper.GetInt("timeout.DelayHeartbeat"))
 }
-//清理超时连接
-func CleanConnection(param interface{}) (result bool) {
-	result = true
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Println("cleanConnection err", r)
-		}
-	}()
-	//fmt.Println("定时任务,清理超时连接 ", param)
-	//node.IsHeartbeatTimeOut()
-	currentTime := uint64(time.Now().Unix())
-	for i := range clientMap {
-		node := clientMap[i]
-		if node.IsHeartbeatTimeOut(currentTime) {
-			fmt.Println("心跳超时..... 关闭连接：", node)
-			node.Conn.Close()
-		}
-	}
-	return result
-}
+
 	//更新用户心跳
 func (node *Node) Heartbeat(currentTime uint64) {
 	node.HeartbeatTime = currentTime
