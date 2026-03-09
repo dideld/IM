@@ -44,9 +44,9 @@ type Node struct {
 	LoginTime     uint64          //登录时间
 	DataQueue     chan []byte     //消息
 	GroupSets     set.Interface   //好友 / 群
+	CurrentHub    *Hub    //记录当前的Node属于哪个分片
 }
 
-var WsHub = NewHub()
 // //映射关系
 // var clientMap map[int64]*Node =make(map[int64]*Node,0)
 
@@ -70,6 +70,7 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 		return 
 	}
 	//2.获取conn
+	targetHub:=WsHub.GetHub(userId)
 	//4.userid和node绑定并加锁
 		node := &Node{
 		UserId:    userId,
@@ -78,7 +79,7 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 		GroupSets: set.New(set.ThreadSafe),
 		HeartbeatTime: uint64(time.Now().Unix()),
 	}
-	WsHub.register <- node
+	targetHub.register<- node
 
 	//5.完成发送逻辑
 	go sendProc(node)
@@ -90,10 +91,9 @@ func sendProc(node *Node){
 	for{
 		select{
 		case data:=<-node.DataQueue:
-			fmt.Println("[ws]sendProc >>> msg",string(data))
+			//fmt.Println("[ws]sendProc >>> msg",string(data))
 			err:=node.Conn.WriteMessage(websocket.TextMessage,data)
 			if err!=nil{
-				fmt.Println(err)
 				return 
 			}
 		}
@@ -101,8 +101,12 @@ func sendProc(node *Node){
 }
 func recvProc(node *Node) {
 	defer func() {
-		WsHub.unregister <- node
-		node.Conn.Close()
+		if node != nil && node.CurrentHub != nil {
+            node.CurrentHub.unregister <- node
+        }
+        if node != nil && node.Conn != nil {
+            node.Conn.Close()
+        }
 	}()
 
 	for {
@@ -131,8 +135,8 @@ func recvProc(node *Node) {
 
 func init(){
 	go udpRevProc() 
-	go WsHub.Run()
-	fmt.Println("init goroutine:------------")
+	//go WsHub.Run()
+	//fmt.Println("init goroutine:------------")
 }
 
 func udpRevProc(){
@@ -152,7 +156,7 @@ func udpRevProc(){
 			fmt.Println(err)
 			return 
 		}
-		fmt.Println("udpRevProc  data :", string(buf[0:n]))
+		//fmt.Println("udpRevProc  data :", string(buf[0:n]))
 		dispatch(buf[0:n])
 	}
 }
@@ -206,7 +210,8 @@ func sendMsg(userId int64, msg []byte) {
 		fmt.Println(e)
 	}
 	fmt.Println(ress)
-	WsHub.send <- &SendRequest{
+	targetHub :=WsHub.GetHub(userId)
+	targetHub.send<- &SendRequest{
 		userID: userId,
 		data:   msg,
 	}
