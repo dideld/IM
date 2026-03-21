@@ -1,11 +1,19 @@
 package models
 
 import (
-	"gorm.io/gorm"
-	"webapp/utils"
+	"context"
+	"encoding/json"
 	"fmt"
 	"time"
+	"webapp/utils"
+
+	"golang.org/x/sync/singleflight"
+	"gorm.io/gorm"
 )
+
+// 全局的 Singleflight 分组，用于保护并发查询
+var sg singleflight.Group
+
 type UserBasic struct {
 	gorm.Model
 	Name string
@@ -67,11 +75,55 @@ func FindUserByEmail(email string) *gorm.DB{
 	user:=UserBasic{}
 	return utils.DB.Where("email = ?",email).First(&user)
 }
-func FindUserById(id uint) UserBasic{
-	user:=UserBasic{}
-	utils.DB.Where("id= ?",id).First(&user)
-	return user
+//cache优化
+func FindUserById(id uint) UserBasic {
+	cacheKey := fmt.Sprintf("user_info:%d", id)
+	ctx := context.Background()
+
+	// 1. 先尝试从 Redis 获取缓存
+	val, err := utils.Red.Get(ctx, cacheKey).Result()
+	if err == nil {
+		// 判断是否是空值防穿透拦截标记
+		if val == "null" {
+			return UserBasic{} // 拦截！直接返回空对象
+		}
+		var user UserBasic
+		json.Unmarshal([]byte(val), &user) // 反序列化返回
+		return user
+	}
+
+	// 2. 如果缓存没命中（或者缓存正好过期），触发 Singleflight 保护机制
+	// 第一个参数是资源 Key，如果有 10000 个请求同时走到这里，
+	// 只有第一个能进匿名函数执行真正查库，其他 9999 个在这行代码阻塞等结果
+	res, err, _ := sg.Do(cacheKey, func() (interface{}, error) {
+		user := UserBasic{}
+		err := utils.DB.Where("id = ?", id).First(&user).Error
+
+		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				// 发生查询不到记录：空值进入缓存防[缓存穿透]
+				// 缓存个 "null" 字符串，过期时间 60 秒
+				utils.Red.Set(ctx, cacheKey, "null", time.Second * 60)
+			}
+			return user, err
+		}
+
+		// 查到了正常数据，写入 Redis，过期时间可按业务设定(例如 1 小时)
+		userData, _ := json.Marshal(user)
+		utils.Red.Set(ctx, cacheKey, userData, time.Hour)
+
+		return user, nil
+	})
+
+	if err != nil {
+		return UserBasic{} 
+	}
+	
+	// 断言并返回
+	return res.(UserBasic)
 }
+
+
 func CreateUser(user UserBasic) *gorm.DB{
 
 	return utils.DB.Create(&user)

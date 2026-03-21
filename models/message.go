@@ -171,8 +171,8 @@ func dispatch(data []byte){
 	}
 	switch msg.Type{
 	 case 1:
-		fmt.Println("dispatch  data :", string(data))
-		sendMsg(int64(msg.TargetId),data,)   //私信
+		//fmt.Println("dispatch  data :", string(data))
+		sendMsg(int64(msg.TargetId),data)   //私信
 	 case 2:
 		sendGroupMsg(int64(msg.TargetId), data)   //群发
 	// case 3:sendAllMsg()        //广播
@@ -196,15 +196,15 @@ func sendMsg(userId int64, msg []byte) {
 	} else {
 		key = "msg_" + targetIdStr + "_" + userIdStr
 	}
-	res, err := utils.Red.ZRevRange(ctx, key, 0, -1).Result()
-	if err != nil {
-		fmt.Println(err)
-	}
-	score := float64(cap(res)) + 1
+	// --- 核心优化点：引入特制 53 Bits 雪花算法生成绝对唯一且递增的消息 ID ---
+	// 替换掉之前性能极差且有大坑的 ZRevRange 取 cap 作为 score 的做法
+	msgId := utils.GenSnowflakeId()
+	score := float64(msgId)
+
 	ress, e := utils.Red.ZAdd(ctx, key, redis.Z{
-    Score:  score,
-    Member: msg,
-}).Result() //jsonMsg
+		Score:  score,
+		Member: msg,
+	}).Result() //jsonMsg
 	//res, e := utils.Red.Do(ctx, "zadd", key, 1, jsonMsg).Result() //备用 后续拓展 记录完整msg
 	if e != nil {
 		fmt.Println(e)
