@@ -1,10 +1,9 @@
 package models
 
-import(
-	"time"
+import (
 	//"fmt"
-	//"github.com/spf13/viper"	
-
+	//"time"
+	//"github.com/spf13/viper"
 )
 type Hub struct {
 	clients    map[int64]*Node
@@ -30,7 +29,6 @@ func NewHub() *Hub {
 	}
 }
 func (h *Hub) Run() {
-	ticker := time.NewTicker(10 * time.Second)
 	for {
 		select {
 
@@ -51,10 +49,7 @@ func (h *Hub) Run() {
 					h.closeNode(node)
 				}
 			}
-		case <-ticker.C:
-			h.checkHeartbeat()
 		}
-		//fmt.Println("连接数:",len(h.clients))
 	}
 }
 func NewHubManager() *HubManager {
@@ -74,19 +69,11 @@ func (m *HubManager) GetHub(userId int64) *Hub {
     index := userId % int64(HubShardCount)
     return m.shards[index]
 }
-var WsHub = NewHubManager()
-func (h *Hub) checkHeartbeat() {
-	current := uint64(time.Now().Unix())
 
-	for userID, node := range h.clients {
-		if node.IsHeartbeatTimeOut(current) {
-			//fmt.Println("当前时间:", current, "心跳时间:", node.HeartbeatTime,"设置时间：",uint64(viper.GetInt("timeout.DelayHeartbeat")))
-			//fmt.Println("心跳超时，踢出:", userID)
-			node.Conn.Close()
-			delete(h.clients, userID)
-		}
-	}
-}
+var WsHub = NewHubManager()
+
+// 废弃原有的 O(N) 心跳轮询检测逻辑，改为由 TimeWheel 时间轮自动 O(1) 踢出
+
 func (h *HubManager) ClientCount() int {
 	count := 0
     for _, shard := range h.shards {

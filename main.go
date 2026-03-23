@@ -14,7 +14,6 @@ func main() {
 	utils.InitConfig()
 	utils.InitMysql()
 	utils.InitRedis()
-	//go models.WsHub.Run()
 	go monitor()
 	r := router.Router()
 	r.Run(viper.GetString("port.server"))

@@ -72,14 +72,29 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 	//2.获取conn
 	targetHub:=WsHub.GetHub(userId)
 	//4.userid和node绑定并加锁
-		node := &Node{
-		UserId:    userId,
-		Conn:      conn,
-		DataQueue: make(chan []byte, 256),
-		GroupSets: set.New(set.ThreadSafe),
+	node := &Node{
+		UserId:        userId,
+		Conn:          conn,
+		DataQueue:     make(chan []byte, 256),
+		GroupSets:     set.New(set.ThreadSafe),
 		HeartbeatTime: uint64(time.Now().Unix()),
+		CurrentHub:    targetHub, // 记录分片以便后续注销
 	}
-	targetHub.register<- node
+	targetHub.register <- node
+
+	// 注册初始心跳任务到时间轮
+	delay := time.Duration(viper.GetInt("timeout.DelayHeartbeat")) * time.Second
+	if delay <= 0 {
+		delay = 60 * time.Second
+	}
+	utils.TW.AddTask(delay, userId, func() {
+		if node.Conn != nil {
+			node.Conn.Close()
+		}
+		if node.CurrentHub != nil {
+			node.CurrentHub.unregister <- node
+		}
+	})
 
 	//5.完成发送逻辑
 	go sendProc(node)
@@ -101,12 +116,15 @@ func sendProc(node *Node){
 }
 func recvProc(node *Node) {
 	defer func() {
+		// 节点断开时，无论是由于自行断开还是被时间轮踢出，彻底安全取消时间轮任务
+		utils.TW.RemoveTask(node.UserId)
+
 		if node != nil && node.CurrentHub != nil {
-            node.CurrentHub.unregister <- node
-        }
-        if node != nil && node.Conn != nil {
-            node.Conn.Close()
-        }
+			node.CurrentHub.unregister <- node
+		}
+		if node != nil && node.Conn != nil {
+			node.Conn.Close()
+		}
 	}()
 
 	for {
@@ -125,7 +143,19 @@ func recvProc(node *Node) {
 
 		// 心跳
 		if msg.Type == 3 {
-			node.Heartbeat(uint64(time.Now().Unix()))
+			// 将心跳延迟任务 O(1) 刷新到时间轮对应的未来槽位
+			delay := time.Duration(viper.GetInt("timeout.DelayHeartbeat")) * time.Second
+			if delay <= 0 {
+				delay = 60 * time.Second
+			}
+			utils.TW.AddTask(delay, node.UserId, func() {
+				if node.Conn != nil {
+					node.Conn.Close()
+				}
+				if node.CurrentHub != nil {
+					node.CurrentHub.unregister <- node
+				}
+			})
 			continue
 		}
 
