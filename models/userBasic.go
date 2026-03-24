@@ -132,12 +132,33 @@ func CreateUser(user UserBasic) *gorm.DB{
 func DeleteUser(user UserBasic)*gorm.DB{
 	return utils.DB.Unscoped().Delete(&user)  //硬删除：添加上Unscoped,但是表仍能看到
 }
-func UpdateUser(user UserBasic)*gorm.DB{
-	    return utils.DB.Model(&user).Updates(map[string]interface{}{
-        "name":      user.Name,
-        "pass_word": user.PassWord, // GORM默认将PassWord转为pass_word
-		"phone":user.Phone,
-		"email":user.Email,
-		"avatar":user.Avatar,
-    })
+func UpdateUser(user UserBasic) *gorm.DB {
+	ctx := context.Background()
+	cacheKey := fmt.Sprintf("user_info:%d", user.ID)
+
+	// 1. 【延时双删 - 第一删】更新数据库前，先删除缓存
+	utils.Red.Del(ctx, cacheKey)
+
+	// 2. 更新数据库
+	db := utils.DB.Model(&user).Where("id = ?", user.ID).Updates(map[string]interface{}{
+		"name":      user.Name,
+		"pass_word": user.PassWord,
+		"phone":     user.Phone,
+		"email":     user.Email,
+		"avatar":    user.Avatar,
+	})
+
+	// 3. 【延时双删 - 第二删】利用我们写的时间轮，进行异步延时删除 (例如 500 毫秒)
+	// 完美解决了休眠阻塞主协程的问题！性能无损！
+	utils.TW.AddTask(500*time.Millisecond, "double_delete_"+cacheKey, func() {
+		// 500ms 后，底层自动执行第二删，确保这段时间内的所有脏数据全被清空
+		utils.Red.Del(context.Background(), cacheKey)
+
+		// 【异步重建】，可以直接在这里查库写入 Redis 
+		userData := FindUserById(user.ID)
+		data, _ := json.Marshal(userData)
+		utils.Red.Set(context.Background(), cacheKey, data, time.Hour)
+	})
+
+	return db
 }
