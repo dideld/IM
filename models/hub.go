@@ -36,7 +36,8 @@ func (h *Hub) Run() {
 			h.clients[node.UserId] = node
 
 		case node := <-h.unregister:
-			if _, ok := h.clients[node.UserId]; ok {
+			// 严格比对地址，防止旧连接的下线事件误删了同一用户在此期间重新建立的新连接
+			if currentNode, ok := h.clients[node.UserId]; ok && currentNode == node {
 				delete(h.clients, node.UserId)
 				close(node.DataQueue)
 			}
@@ -81,7 +82,10 @@ func (h *HubManager) ClientCount() int {
     }
     return count
 }
-func (h *Hub)closeNode(node *Node){
-	close(node.DataQueue)
-	delete(h.clients, node.UserId)
+func (h *Hub) closeNode(node *Node) {
+	// 同样做地址校验防范 double close 引发 panic
+	if currentNode, ok := h.clients[node.UserId]; ok && currentNode == node {
+		delete(h.clients, node.UserId)
+		close(node.DataQueue)
+	}
 }

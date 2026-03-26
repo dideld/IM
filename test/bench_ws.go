@@ -19,7 +19,7 @@ var (
 )
 
 func main() {
-	totalClients := 50000      // 目标压测总连接数
+	totalClients := 20000      // 目标压测总连接数
 	dialConcurrency := 200     // 建连并发度 (测试系统瞬时抗压/握手能力)
 	messageRatePerSec := 2     // 单个用户每秒发多少条消息 (用于测出真实 QPS 带宽)
 
