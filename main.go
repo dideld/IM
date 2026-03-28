@@ -14,6 +14,8 @@ func main() {
 	utils.InitConfig()
 	utils.InitMysql()
 	utils.InitRedis()
+	utils.InitKafka()           // 1. 先初始化 Kafka Producer
+	models.StartKafkaConsumer() // 2. 再挂载消费者监控和持久化存库逻辑
 	go monitor()
 	r := router.Router()
 	r.Run(viper.GetString("port.server"))
@@ -38,6 +40,6 @@ func monitor() {
 
 		fmt.Println("====================")
 
-		time.Sleep(5 * time.Second)
+		time.Sleep(10 * time.Second)
 	}
 }

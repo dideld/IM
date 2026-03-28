@@ -53,9 +53,8 @@ type Node struct {
 // //读写锁
 // var rwLock sync.RWMutex
 
-// 企业级巅峰架构：真正的【路由分发】与【落盘持久化】双线解耦
-// 内存操作维持纳秒级 (0.0001ms)，极耗时的 Redis/DB 抛入后台慢速消化区
-var SaveQueue = make(chan []byte, 100000)
+// 企业级终极架构：集群路由分发 + Kafka 全链路解耦
+// 单机级别的 Go Channel 升级为极其强大的分布式中间件，确保消息永不丢失
 
 func Chat(writer http.ResponseWriter,request *http.Request){
 	//1.获取参数并校验合法性
@@ -139,7 +138,7 @@ func recvProc(node *Node) {
 	for {
 		_, data, err := node.Conn.ReadMessage()
 		if err != nil {
-			fmt.Println("read error:", err)
+			//fmt.Println("read error:", err)
 			break
 		}
 
@@ -176,16 +175,11 @@ func recvProc(node *Node) {
 func init() {
 	go udpRevProc()
 
-	// 启动 500 个后台纯落盘协程，匹配你的 Redis PoolSize:500 达到极限吞吐
-	for i := 0; i < 500; i++ {
-		go saveWorker(i)
-	}
 }
 
-func saveWorker(id int) {
-	for data := range SaveQueue {
-		saveToRedis(data) // 后台协程排队慢慢消化耗时的 Redis ZAdd 等操作
-	}
+// StartKafkaConsumer 对外暴露给 main 函数，用于注册消费群组回调
+func StartKafkaConsumer() {
+	utils.StartKafkaConsumer(saveToRedis)
 }
 
 func udpRevProc(){
@@ -243,13 +237,9 @@ func sendMsg(userId int64, msgData []byte) {
 		data:   msgData,
 	}
 
-	// 第二阶段：异步转交后台的 500 名底层特种兵慢慢落盘 Redis 数据库
-	select {
-	case SaveQueue <- msgData:
-	default:
-		// 当这 10 万的队列依然被灌满时，也仅表现为有部分聊天记录少存了 Redis，
-		// 但由于第一阶段的极速派发，两人聊天的体验永远不会卡顿断线！
-	}
+	// 第二阶段：通过微服务架构思维，跨进程投递给外部的高可用 Kafka 集群
+	// 后台 Consumer 消费者组会自动接手这段数据慢慢存入 Redis。哪怕 Go 服务崩溃重启，消息也不会丢！
+	utils.SendMsgToKafka(msgData)
 }
 
 func saveToRedis(msgData []byte) {
