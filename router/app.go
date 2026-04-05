@@ -3,6 +3,7 @@ package router
 import (
 	"webapp/service"
 
+	"github.com/gin-contrib/pprof"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 	docs "webapp/docs"
@@ -10,6 +11,7 @@ import (
 )
 func Router() *gin.Engine{
 	r := gin.Default()
+	pprof.Register(r)
 	docs.SwaggerInfo.BasePath="/"
 	//swagger
 	swaggerURL := ginSwagger.URL("http://localhost:8080/swagger/doc.json")
