@@ -1,7 +1,7 @@
 mysql:
-  dns: root:111111@tcp(127.0.0.1:3306)/ginchat?charset=utf8mb4&parseTime=True&loc=Local
+  dns: root:111111@tcp(host.docker.internal:3306)/ginchat?charset=utf8mb4&parseTime=True&loc=Local
 redis:
-  addr: "127.0.0.1:6379"
+  addr: "host.docker.internal:6379"
   password: ""
   DB: 0
   poolSize: 500
@@ -9,9 +9,9 @@ redis:
 timeout:
   DelayHeartbeat: 60   #延迟心跳时间  单位秒
   HeartbeatHz: 10   #每隔多少秒心跳时间   
-  HeartbeatMaxTime: 30000  #最大心跳时间  ，超过此就下线 
-  RedisOnlineTime: 4  #缓存的在线用户时长   单位H
+  HeartbeatMaxTime: 3600  #最大心跳时间 ，超过此就下线 
+  RedisOnlineTime: 2  #缓存的在线用户时长   单位H
 port:
-  server: "127.0.0.1:8081"
+  server: "0.0.0.0:8081"
   udp: 3001
   upload_path: "C:/Users/27177/Desktop/webapp/cache"

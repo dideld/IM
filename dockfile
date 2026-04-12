@@ -1,10 +1,11 @@
 # 阶段 1: 编译环境
-FROM golang:1.21-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 # 设置工作目录
 WORKDIR /app
 
 # 设置代理（国内服务器构建必选，否则拉不动包）
+ENV GO111MODULE=on
 ENV GOPROXY=https://goproxy.cn,direct
 
 # 先复制 mod 文件，利用 Docker 缓存层优化构建速度
@@ -22,12 +23,13 @@ FROM alpine:latest
 
 WORKDIR /app
 
-# 从编译阶段拷贝二进制文件和配置文件
-COPY --from:builder /app/main .
-COPY --from:builder /app/config.yaml . 
+# 从编译阶段拷贝二进制文件和需要的目录（模板和配置）
+COPY --from=builder /app/main .
+COPY --from=builder /app/config ./config
+COPY --from=builder /app/views ./views
 
-# 暴露 Gin 默认端口（假设你在 app.yml 配置的是 8080）
-EXPOSE 8080
+# 暴露 Gin 实际配置端口
+EXPOSE 8081
 
 # 启动程序
 CMD ["./main"]

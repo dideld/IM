@@ -1,0 +1,20 @@
+
+services:
+  go_app:
+    build:
+      context: .
+      dockerfile: dockfile
+    ports:
+      - "8081:8081" # 映射给宿主机供调试使用（可选）
+    restart: always
+
+  nginx_web:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes: # 生产环境常挂载宿主机目录，也可在 nginx container build 里 COPY 进去
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./asset:/usr/share/nginx/html/asset:ro
+    depends_on:
+      - go_app
+    restart: always

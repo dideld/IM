@@ -14,7 +14,7 @@ var (
 )
 
 const TopicChatMessages = "chat_messages"
-const KafkaBroker = "127.0.0.1:9092"
+const KafkaBroker = "host.docker.internal:9092"
 
 // InitKafka 初始化 Kafka 生产者
 func InitKafka() {
