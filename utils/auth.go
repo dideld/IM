@@ -49,6 +49,18 @@ func IssueToken(userId uint) string {
 	return token
 }
 
+// UserIdByToken 按 token 查会话主人（HTTP 层鉴权中间件用；不校验归属，返回值即身份）
+func UserIdByToken(token string) (int64, bool) {
+	if token == "" {
+		return 0, false
+	}
+	uid, err := Red.Get(context.Background(), tokenKeyPrefix+token).Uint64()
+	if err != nil {
+		return 0, false
+	}
+	return int64(uid), true
+}
+
 // ValidateToken 校验 token 是否属于该用户（WS 握手使用，不续期）
 func ValidateToken(token string, userId int64) bool {
 	if token == "" || userId <= 0 {

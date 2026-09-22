@@ -387,6 +387,36 @@
                         Vue.delete(that.unread, convId);
                     })
                 },
+                bindHistHandler: function (convId, resolve) {
+                    //下拉获取历史消息记录（私聊/群聊共用）：先解绑上一个会话的监听，防止每次点击堆叠
+                    var wrapper = document.querySelector('.mui-scroll-wrapper');
+                    if (this._histHandler && wrapper) {
+                        wrapper.removeEventListener('scroll', this._histHandler);
+                    }
+                    this._histHandler = (e) => {
+                        let translate = e.target.style?.transform?.match(/translate3d\(\d+px,\s*(\d+)px,\s*(\d+)px\)/i);
+                        if (translate && translate.length > 1) {
+                            if (translate[1] > 0 && this.isLoadMore == false) {
+                                this.isLoadMore = true;
+                                this.start = this.end + 1;
+                                this.end = this.end + 2;
+                                post("user/redisMsg", { convId: convId, start: this.start, end: this.end, isRev: false }, function (res) {
+                                    //循环读取的消息记录 并显示
+                                    for (var i in res.Total) {
+                                        var msg = JSON.parse(res.Total[i]);
+                                        this.showmsg(resolve(msg), msg, true)
+                                    }
+                                    setTimeout(() => {
+                                        this.isLoadMore = false;
+                                    }, 300);
+                                }.bind(this))
+                            }
+                        }
+                    };
+                    if (wrapper) {
+                        wrapper.addEventListener('scroll', this._histHandler)
+                    }
+                },
                 // ===== P1 end =====
                 singlemsg: function (user) {
                     this.start = 0;
@@ -421,33 +451,8 @@
                             deceleration: 0.0006, //阻尼系数,系数越小滑动越灵敏
                             bounce: true //是否启用回弹
                         });
-                        //下拉获取历史消息记录：先解绑上一个会话的监听，防止每次点击都堆叠
-                        var wrapper = document.querySelector('.mui-scroll-wrapper');
-                        if (this._histHandler && wrapper) {
-                            wrapper.removeEventListener('scroll', this._histHandler);
-                        }
-                        this._histHandler = (e) => {
-                            let translate = e.target.style?.transform?.match(/translate3d\(\d+px,\s*(\d+)px,\s*(\d+)px\)/i);
-                            if (translate && translate.length > 1) {
-                                if (translate[1] > 0 && this.isLoadMore == false) {
-                                    this.isLoadMore = true;
-                                    this.start = this.end + 1;
-                                    this.end = this.end + 2;
-                                    post("user/redisMsg", { convId: convId, start: this.start, end: this.end, isRev: false }, function (res) {
-                                        //循环读取的消息记录 并显示
-                                        for (var i in res.Total) {
-                                            this.showmsg(user, JSON.parse(res.Total[i]), true)
-                                        }
-                                        setTimeout(() => {
-                                            this.isLoadMore = false;
-                                        }, 300);
-                                    }.bind(this))
-                                }
-                            }
-                        };
-                        if (wrapper) {
-                            wrapper.addEventListener('scroll', this._histHandler)
-                        }
+                        //下拉获取历史消息记录
+                        this.bindHistHandler(convId, function (msg) { return user })
                     }
                 },
                 //群聊的初始化
@@ -474,6 +479,8 @@
                             })
                             this.isReadRedisMsg.push(convId)
                         }
+                        //下拉翻页：按消息发送者解析头像昵称（成员不在好友缓存时降级占位）
+                        this.bindHistHandler(convId, (msg) => this.usermap["" + msg.userId] || { Name: "未知用户", Avatar: "" })
                         this.markRead(convId)
                     }
                 },

@@ -49,7 +49,9 @@ main.go → router/app.go（路由注册）→ service/*（HTTP controller，Swa
 - 登录（`models.FindUserByNameAndPwd`）签发 32-hex `crypto/rand` token：`login:token:{t}` = userId（TTL `auth.tokenTTLHours`，缺省 24h），并登记到 `login:user:{uid}` 集合；token 回写 `user_basic.identity`，前端 `/toChat?token=` 一路带到 `/chat`。
 - `/chat` 握手**在 Upgrade 之前**校验 `utils.ValidateToken(token, userId)`，失败回 401 不升级连接；心跳帧（Type=3）调 `TouchToken` 滑动续期（token 与会话集合一起）。
 - `models.UpdateUser` 调 `DropUserSessions` 撤销该用户全部会话（强制重新登录；已建立的 WS 不受影响，只挡新连接）。
-- Redis key 命名空间：`login:*`（鉴权）、`user_info:*`（缓存）、`msg_*`（热层消息）互不冲突，新增鉴权相关 key 请保持 `login:` 前缀。
+- **HTTP 层鉴权（P1.5）**：`service.AuthRequired` 中间件保护除登录注册、`/chat`（自校验）、页面/静态/Swagger 外的全部业务接口；前端 `head.html` 的 `post/uploadfile/uploadblob` 与 `util.js` 的 `util.post` 统一带 `X-Token` 头（值取页面 URL 的 token），401 时 toast 并跳登录。**各 handler 一律以 `authUid(c)` 为身份来源，绝不再信表单里的 userId/ownerId**；读会话接口还要过 `models.ConvHasMember(convId, uid)` 成员校验（合法会话也读不了别人的对话）。
+- **改密链路**：`updateUser` 密码非空时先 `MakePassword` 加盐哈希（沿用旧盐，无盐轮换）再落库，`models.UpdateUser` 的 Updates map 仅在 `PassWord`/`Salt` 非空时写入——明文永不进 DB；变更后 `DropUserSessions` 全端踢线。
+- Redis key 命名空间：`login:*`（鉴权）、`user_info:*`（缓存）、`p_*`/`g_*`（热层会话，见"Redis key 约定"）互不冲突，新增鉴权相关 key 请保持 `login:` 前缀。
 
 ### 分片 Hub 与 Node 生命周期（`models/hub.go`，改动前必读）
 
@@ -70,7 +72,7 @@ main.go → router/app.go（路由注册）→ service/*（HTTP controller，Swa
 - `seq:{convId}`：会话级递增序号发号器（`INCR`，消费者是唯一写入点）。**热层 ZSet 的 score = seq**（不再是雪花；53-bit 精度约束现在只剩 msgId 需要）。ZSet 修剪至 `storage.hotKeep` + 滑动 TTL 逻辑不变。
 - **消息冷热存储（`models/store.go`）**：消费者回调 `persistMessage`：发 seq → 热层 Pipeline → 投 `coldCh` 由 `StartColdWriter` 批量 `CreateInBatches`（主键 id=雪花 msgId，`(conv_key, seq)` 复合唯一索引 `uk_conv_seq`；OnConflict DoNothing + 冲突跳过计数【警告】；停机由 `StopColdWriter` 同步排空）。
 - **未读数与已读**：HASH `unread:{uid}`（field=convId）由 `pushUnread` 累加（私聊给接收方；群聊给除发送者外全体成员），随后向在线用户 `deliverLocal` 推 `Type=4` 事件 `{"Type":4,"ConvId","Seq","Unread"}`——**仅服务端→客户端**，前端 `onmessage` 必须在 `loaduserinfo` 之前拦截该帧（否则会对无 userId 的帧发无效 HTTP 并污染 msglist）。`markRead` 清计数并写游标 `read:{uid}:{convId}`；`unreadList` 供前端开页/重连拉全量。
-- 读接口三条：`/user/redisMsg` 热层（`convId` 参数，兼容 userIdA/B 推导；**响应列表在 `Total` 字段的前端契约勿改**）；`/user/historyMsg` 冷层（`convId + beforeSeq + size`，Rows 含 Seq，末行 seq 翻下页）；`/user/markRead`、`/user/unreadList`（userId 参数——HTTP 层尚无鉴权，见遗留）。
+- 读接口三条（全部经 X-Token 会话鉴权 + `ConvHasMember` 成员校验）：`/user/redisMsg` 热层（`convId` 参数，兼容 userIdA/B 推导；**响应列表在 `Total` 字段的前端契约勿改**）；`/user/historyMsg` 冷层（`convId + beforeSeq + size`，Rows 含 Seq，末行 seq 翻下页）；`/user/markRead`、`/user/unreadList`（身份取会话，表单 userId 被忽略）。
 
 ### 雪花 ID（`utils/snowflake.go`）
 

@@ -55,7 +55,7 @@ go run test/bench_ws.go         # 2 万连接 WS 压测（独立 main 程序，�
 
 ### 鉴权
 
-登录（`/user/findUserByNameAndPwd`）由服务端签发 32-hex 随机 **会话 token** 存 Redis（`login:token:{t}` = userId，TTL `auth.tokenTTLHours` 缺省 24h），并回写 `user.identity` 供前端携带。`/chat` 在 WebSocket 升级**之前**校验 token，未授权直接 401；心跳帧顺带滑动续期；修改用户资料会撤销该用户全部会话（强制重登）。单机架构下未选 JWT——长连接场景需要服务端可控的撤销/踢线能力，而这 JWT 反而要再引黑名单存储。
+登录（`/user/findUserByNameAndPwd`）由服务端签发 32-hex 随机 **会话 token** 存 Redis（`login:token:{t}` = userId，TTL `auth.tokenTTLHours` 缺省 24h），并回写 `user.identity` 供前端携带。`/chat` 在 WebSocket 升级**之前**校验 token，未授权直接 401；心跳帧顺带滑动续期；修改资料/密码会撤销该用户全部会话（强制重登）。**全部业务 HTTP 接口走同一 `X-Token` 中间件**：身份从会话解析（表单 userId 不再可信），读会话的接口再做 `ConvHasMember` 成员校验——登了录也读不到别人的对话。单机架构下未选 JWT——长连接场景需要服务端可控的撤销/踢线能力，而这 JWT 反而要再引黑名单存储。
 
 ### 消息 ID 与会话 seq（双轨模型）
 
@@ -114,13 +114,14 @@ test/          bench_ws.go 压测     docs/  swag 生成物
 已完成（P0）：WS 鉴权（Redis 会话 token）、雪花 workerId 配置化 + 主键冲突告警、优雅停机（冷队列排空）、上传白名单/大小校验。
 已完成（P1）：会话实体化（convId `p_`/`g_` 命名空间）、seq 双轨（排序/游标/未读）、群历史全员统一回读、未读红点+打开即已读+在线 Type=4 事件。
 
+已完成（P1.5）：HTTP 层鉴权（X-Token 会话身份 + ConvHasMember 成员校验，表单 userId 不再可信）、改密加盐哈希落库 + 全端踢线、401 统一跳登录、群历史下拉翻页。
+
 待做（按优先级）：
 
-- HTTP 接口层鉴权（WS 握手已有会话校验，但 `/user/*`、`/contact/*` 仍裸奔：`markRead`/`unreadList` 的 userId 可伪造，统一从 token 解析身份是下一步）
 - 消息幂等去重（clientMsgId，解决 Kafka 至少一次的重放复制）、多端在线（Hub 按设备分叉）
-- 已读回执与 `Message.ReadTime` 落库、群历史下拉翻页（当前群首开只回灌热层首页）
-- 水平扩展（uid→节点路由表 + 跨节点消息转发）、冷存归档分区、Redis 内存治理
-- 口令哈希仍为 MD5+盐（建议 bcrypt）；修改资料接口会把明文密码直写（遗留问题）；日志为裸 fmt.Println、无单元测试
+- 已读回执与 `Message.ReadTime` 落库
+- 水平扩展（uid→节点路由表 + 跨节点消息转发；注意 seq 发号当前假设消费者单点）、冷存归档分区、Redis 内存治理
+- 口令哈希仍为 MD5+盐（建议 bcrypt）；日志为裸 fmt.Println、无单元测试
 
 ## License
 

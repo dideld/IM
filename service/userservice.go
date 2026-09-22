@@ -94,6 +94,10 @@ func CreateUser(c *gin.Context){
 func DeleteUser(c *gin.Context){
 	user:=models.UserBasic{}
 	id,_:=strconv.Atoi(c.Query("id"))
+	if int64(id) != authUid(c) {
+		utils.RespFail(c.Writer, "无权删除他人")
+		return
+	}
 	user.ID=uint(id)
 	models.DeleteUser(user)
 	c.JSON(200, gin.H{
@@ -118,9 +122,23 @@ func DeleteUser(c *gin.Context){
 func UpdateUser(c *gin.Context){
 	user:=models.UserBasic{}
 	id,_:=strconv.Atoi(c.PostForm("id"))
+	if int64(id) != authUid(c) {
+		utils.RespFail(c.Writer, "无权修改他人资料")
+		return
+	}
 	user.ID=uint(id)
 	user.Name=c.PostForm("name")
-	user.PassWord=c.PostForm("password")
+	newPwd:=c.PostForm("password")
+	if newPwd != "" {
+		// 加盐哈希后才落库（此前明文直写会破坏登录凭据体系）；沿用旧盐，无盐则轮换
+		exist := models.FindUserById(user.ID)
+		salt := exist.Salt
+		if salt == "" {
+			salt = fmt.Sprintf("%06d", rand.Int32())
+			user.Salt = salt
+		}
+		user.PassWord = utils.MakePassword(newPwd, salt)
+	}
 	user.Phone=c.PostForm("phone")
 	user.Avatar=c.PostForm("icon")
 	user.Email=c.PostForm("email")
@@ -196,6 +214,10 @@ func RedisMsg(c *gin.Context){
 		}
 		convId = models.ConvIdPrivate(int64(userIdA), int64(userIdB))
 	}
+	if !models.ConvHasMember(convId, authUid(c)) {
+		utils.RespFail(c.Writer, "无权读取该会话")
+		return
+	}
 	start, _ := strconv.Atoi(c.PostForm("start"))
 	end, _ := strconv.Atoi(c.PostForm("end"))
 	isRev, _ := strconv.ParseBool(c.PostForm("isRev"))
@@ -230,6 +252,10 @@ func HistoryMsg(c *gin.Context){
 		utils.RespFail(c.Writer, "参数错误：需要 convId")
 		return
 	}
+	if !models.ConvHasMember(convId, authUid(c)) {
+		utils.RespFail(c.Writer, "无权读取该会话")
+		return
+	}
 	list := models.LoadHistory(convId, beforeSeq, size)
 	utils.RespOkList(c.Writer, list, len(list))
 }
@@ -243,10 +269,14 @@ func HistoryMsg(c *gin.Context){
 // @Success 200 {string} json{"code"，"message"}
 // @Router /user/markRead [post]
 func MarkRead(c *gin.Context){
-	userId, _ := strconv.ParseInt(c.PostForm("userId"), 10, 64)
+	userId := authUid(c)
 	convId := c.PostForm("convId")
-	if userId <= 0 || convId == "" {
+	if convId == "" {
 		utils.RespFail(c.Writer, "参数错误")
+		return
+	}
+	if !models.ConvHasMember(convId, userId) {
+		utils.RespFail(c.Writer, "无权操作该会话")
 		return
 	}
 	models.MarkRead(userId, convId)
@@ -261,16 +291,11 @@ func MarkRead(c *gin.Context){
 // @Success 200 {string} json{"code"，"message"}
 // @Router /user/unreadList [post]
 func UnreadList(c *gin.Context){
-	userId, _ := strconv.ParseInt(c.PostForm("userId"), 10, 64)
-	if userId <= 0 {
-		utils.RespFail(c.Writer, "参数错误")
-		return
-	}
-	utils.RespOk(c.Writer, models.UnreadMap(userId), "ok")
+	utils.RespOk(c.Writer, models.UnreadMap(authUid(c)), "ok")
 }
 func SearchFriends(c *gin.Context){
-	id,_:=strconv.Atoi(c.Request.FormValue("userId"))
-	users:=models.SearchFriend(uint(id))
+	//身份以会话为准，表单 userId 不再可信
+	users:=models.SearchFriend(uint(authUid(c)))
 	// c.JSON(200,gin.H{
 	// 	"code":  0,
 	// 	"message":"查询好友列表成功！",
@@ -280,10 +305,9 @@ func SearchFriends(c *gin.Context){
 }
 
 func AddFriend(c *gin.Context){
-	userId,_:=strconv.Atoi(c.Request.FormValue("userId"))
 	targetId,_:=strconv.Atoi(c.Request.FormValue("targetId"))
 
-	code:=models.AddFriend(uint(userId),uint(targetId))
+	code:=models.AddFriend(uint(authUid(c)),uint(targetId))
 	if code == 0{
 			utils.RespOk(c.Writer,code,"添加成功")
 
@@ -301,12 +325,11 @@ func AddFriend(c *gin.Context){
 }
 //新建群
 func CreateCommunity(c *gin.Context){
-	ownerId,_:=strconv.Atoi(c.Request.FormValue("ownerId"))
 	Name:=c.Request.FormValue("name")
 	icon:=c.Request.FormValue("icon")
 	desc:=c.Request.FormValue("desc")
 	community :=models.Community{}
-	community.OwnerId=uint(ownerId)
+	community.OwnerId=uint(authUid(c))
 	community.Name = Name
 	community.Img=icon
 	community.Desc=desc
@@ -324,8 +347,7 @@ func CreateCommunity(c *gin.Context){
 }
 //加载群
 func LoadCommunity(c *gin.Context){
-	ownerId,_:=strconv.Atoi(c.Request.FormValue("ownerId"))
-	data,msg :=models.LoadCommunity(uint(ownerId))
+	data,msg :=models.LoadCommunity(uint(authUid(c)))
 
 	if len(data)!=0{
 		utils.RespList(c.Writer,0,data,msg)
@@ -336,10 +358,9 @@ func LoadCommunity(c *gin.Context){
 }
 
 func JoinGroup( c *gin.Context){
-	userId,_:=strconv.Atoi(c.Request.FormValue("userId"))
 	comId:=c.Request.FormValue("comId")
 
-	data,msg:=models.JoinGroup(uint(userId),comId)
+	data,msg:=models.JoinGroup(uint(authUid(c)),comId)
 	if data ==0{
 		utils.RespOk(c.Writer,data,msg)
 	}else{
@@ -348,9 +369,8 @@ func JoinGroup( c *gin.Context){
 }
 
 func DeleteFriend(c *gin.Context){
-	ownerId,_:=strconv.Atoi(c.Request.FormValue("ownerId"))
 	targetId,_:=strconv.Atoi(c.Request.FormValue("targetId"))
-	data, msg := models.DeleteFriend(uint(ownerId), uint(targetId))
+	data, msg := models.DeleteFriend(uint(authUid(c)), uint(targetId))
 
 	if data == 0 {
 		utils.RespOk(c.Writer, data, msg)

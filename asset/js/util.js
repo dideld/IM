@@ -120,9 +120,14 @@ Core.prototype.post=function(uri,data,fn){
         	"Content-Type",
 			"application/x-www-form-urlencoded"
 		);
+		// 会话鉴权：携带页面 URL 透传的 token（登录/注册页为空，对应接口不鉴权）
+		xhr.setRequestHeader("X-Token", (window.util && window.util.parseQuery("token")) || "");
         xhr.onreadystatechange = function() {
-            if (xhr.readyState == 4 && (xhr.status == 200 || xhr.status == 304)) {
-                resolve(JSON.parse(xhr.responseText));
+            if (xhr.readyState == 4) {
+                if (xhr.status == 401) { reject({"code":-1,"msg":"未登录或会话已过期"}); return; }
+                if (xhr.status == 200 || xhr.status == 304) {
+                    resolve(JSON.parse(xhr.responseText));
+                }
             }
         };
         xhr.onerror = function(){

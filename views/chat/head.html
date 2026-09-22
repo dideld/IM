@@ -56,9 +56,14 @@
                 xhr.open("POST","//"+location.host+"/"+uri, true);
                 // 添加http头，发送信息至服务器时内容编码类型
                 xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
+                // 会话鉴权：携带页面 URL 透传的 token
+                xhr.setRequestHeader("X-Token", (window.util && util.parseQuery("token")) || "");
                 xhr.onreadystatechange = function() {
-                    if (xhr.readyState == 4 && (xhr.status == 200 || xhr.status == 304)) {
-                        fn.call(this, JSON.parse(xhr.responseText));
+                    if (xhr.readyState == 4) {
+                        if (xhr.status == 401) { mui.toast("登录会话已过期，请重新登录"); location.href = "/"; return; }
+                        if (xhr.status == 200 || xhr.status == 304) {
+                            fn.call(this, JSON.parse(xhr.responseText));
+                        }
                     }
                 };
                 var _data=[];
@@ -73,10 +78,13 @@
             function uploadfile(uri,dom,fn){
                 var xhr = new XMLHttpRequest();
                 xhr.open("POST","//"+location.host+"/"+uri, true);
-                // 添加http头，发送信息至服务器时内容编码类型
+                xhr.setRequestHeader("X-Token", (window.util && util.parseQuery("token")) || "");
                 xhr.onreadystatechange = function() {
-                    if (xhr.readyState == 4 && (xhr.status == 200 || xhr.status == 304)) {
-                        fn.call(this, JSON.parse(xhr.responseText));
+                    if (xhr.readyState == 4) {
+                        if (xhr.status == 401) { mui.toast("登录会话已过期，请重新登录"); location.href = "/"; return; }
+                        if (xhr.status == 200 || xhr.status == 304) {
+                            fn.call(this, JSON.parse(xhr.responseText));
+                        }
                     }
                 };
                 var _data=[];
@@ -90,10 +98,13 @@
    function uploadblob(uri,blob,filetype,fn){
        var xhr = new XMLHttpRequest();
        xhr.open("POST","//"+location.host+"/"+uri, true);
-       // 添加http头，发送信息至服务器时内容编码类型
+       xhr.setRequestHeader("X-Token", (window.util && util.parseQuery("token")) || "");
        xhr.onreadystatechange = function() {
-           if (xhr.readyState == 4 && (xhr.status == 200 || xhr.status == 304)) {
-               fn.call(this, JSON.parse(xhr.responseText));
+           if (xhr.readyState == 4) {
+               if (xhr.status == 401) { mui.toast("登录会话已过期，请重新登录"); location.href = "/"; return; }
+               if (xhr.status == 200 || xhr.status == 304) {
+                   fn.call(this, JSON.parse(xhr.responseText));
+               }
            }
        };
        var _data=[];

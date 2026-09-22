@@ -139,14 +139,20 @@ func UpdateUser(user UserBasic) *gorm.DB {
 	// 1. 【延时双删 - 第一删】更新数据库前，先删除缓存
 	utils.Red.Del(ctx, cacheKey)
 
-	// 2. 更新数据库
-	db := utils.DB.Model(&user).Where("id = ?", user.ID).Updates(map[string]interface{}{
-		"name":      user.Name,
-		"pass_word": user.PassWord,
-		"phone":     user.Phone,
-		"email":     user.Email,
-		"avatar":    user.Avatar,
-	})
+	// 2. 更新数据库（密码/盐为空时不写入，防止覆盖凭据；service 层负责加盐哈希后传入）
+	upds := map[string]interface{}{
+		"name":   user.Name,
+		"phone":  user.Phone,
+		"email":  user.Email,
+		"avatar": user.Avatar,
+	}
+	if user.PassWord != "" {
+		upds["pass_word"] = user.PassWord
+	}
+	if user.Salt != "" {
+		upds["salt"] = user.Salt
+	}
+	db := utils.DB.Model(&user).Where("id = ?", user.ID).Updates(upds)
 
 	// 3. 【延时双删 - 第二删】利用我们写的时间轮，进行异步延时删除 (例如 500 毫秒)
 	// 完美解决了休眠阻塞主协程的问题！性能无损！

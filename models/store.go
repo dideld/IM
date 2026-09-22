@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 	"webapp/utils"
 
@@ -150,6 +151,39 @@ func pushUnread(convId string, seq int64, uids []int64) {
 		// 仅内存推送，不落任何存储；离线用户下次 unreadList 拉全量补偿
 		deliverLocal(uid, evt)
 	}
+}
+
+// ConvHasMember 会话成员校验（HTTP 鉴权后仍要挡"读别人会话"）：
+// p_{a}_{b} 需为两端之一；g_{群id} 需在该群 contact 成员表内。
+func ConvHasMember(convId string, uid int64) bool {
+	if uid <= 0 {
+		return false
+	}
+	if strings.HasPrefix(convId, "g_") {
+		gid, err := strconv.ParseUint(convId[2:], 10, 32)
+		if err != nil {
+			return false
+		}
+		for _, m := range SearchUserByGroupId(uint(gid)) {
+			if int64(m) == uid {
+				return true
+			}
+		}
+		return false
+	}
+	if strings.HasPrefix(convId, "p_") {
+		parts := strings.Split(convId[2:], "_")
+		if len(parts) != 2 {
+			return false
+		}
+		a, e1 := strconv.ParseInt(parts[0], 10, 64)
+		b, e2 := strconv.ParseInt(parts[1], 10, 64)
+		if e1 != nil || e2 != nil {
+			return false
+		}
+		return a == uid || b == uid
+	}
+	return false
 }
 
 // MarkRead 打开会话即已读：清未读计数并记录 seq 游标（多端同步预留）
