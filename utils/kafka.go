@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -15,6 +16,9 @@ import (
 
 var (
 	KafkaWriter *kafka.Writer
+	kafkaReader *kafka.Reader
+	kafkaQuit   chan struct{}
+	kafkaOnce   sync.Once
 )
 
 // kafkaConf 读取 kafka.* 配置，缺省时回退本地开发默认值（保证删掉配置也能起服务）
@@ -92,7 +96,9 @@ func SendMsgToKafka(msgData []byte) {
 
 // StartKafkaConsumer 启动消费者负责排队落盘 Redis
 func StartKafkaConsumer(consumeHandler func([]byte)) {
-	reader := kafka.NewReader(kafka.ReaderConfig{
+	kafkaQuit = make(chan struct{})
+	kafkaOnce = sync.Once{}
+	kafkaReader = kafka.NewReader(kafka.ReaderConfig{
 		Brokers: []string{kafkaConf("broker", "host.docker.internal:9092")},
 		GroupID: kafkaConf("consumerGroup", "chat_redis_saver_group"), // 支持横向扩展，开再多服也是同一个组排队
 		Topic:   kafkaConf("topic", "chat_messages"),
@@ -105,9 +111,20 @@ func StartKafkaConsumer(consumeHandler func([]byte)) {
 
 	go func() {
 		for {
-			m, err := reader.ReadMessage(context.Background())
+			select {
+			case <-kafkaQuit:
+				fmt.Println("Kafka consumer stopping, bye.")
+				return
+			default:
+			}
+			m, err := kafkaReader.ReadMessage(context.Background())
 			if err != nil {
 				log.Println("Kafka Read Error (Retrying...):", err)
+				select {
+				case <-kafkaQuit:
+					return
+				default:
+				}
 				time.Sleep(3 * time.Second) // 避雷：没开 kafka 时防死循环暴搜
 				continue
 			}
@@ -115,4 +132,17 @@ func StartKafkaConsumer(consumeHandler func([]byte)) {
 			consumeHandler(m.Value)
 		}
 	}()
+}
+
+// CloseKafka 优雅停机：停消费循环、关 reader 与 writer
+func CloseKafka() {
+	if kafkaQuit != nil {
+		kafkaOnce.Do(func() { close(kafkaQuit) })
+	}
+	if kafkaReader != nil {
+		kafkaReader.Close()
+	}
+	if KafkaWriter != nil {
+		KafkaWriter.Close()
+	}
 }

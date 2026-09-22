@@ -21,8 +21,10 @@ go run test/bench_ws.go         # WS 压测（2 万连接），独立 main 程�
 ## 运行前提与配置坑
 
 - 依赖 MySQL / Redis / Kafka。所有地址均在 `config/app.yml`（含 `kafka.broker/topic/consumerGroup`）；代码里带本地开发默认值回退（缺键也能起服务，回退 `host.docker.internal`）。
-- 上传目录走 `upload.path`（缺省 `./asset/upload`），目录不存在会自动创建。`asset/upload/` 与 `cache/` 已 gitignore，用户产物不得再提交。
-- 初始化顺序有依赖（`main.go`）：InitConfig → InitMysql → models.Migrate（AutoMigrate 同步表结构）→ InitRedis → models.StartColdWriter（冷存落盘 worker）→ InitKafka（生产者）→ StartKafkaConsumer（消费者）。时间轮 `utils.TW` 和 UDP 监听（3001 端口）由包 `init()` 自动启动，不在 main 里显式出现。
+- 上传目录走 `upload.path`（缺省 `./asset/upload`，不存在自动创建），单文件上限 `upload.maxSizeMB`（缺省 10MB，`MaxBytesReader` 硬限）；扩展名白名单在 `service/attach.go`（图片+音频，白名单外拒绝——该目录被 Nginx 直接托管）。`asset/upload/` 与 `cache/` 已 gitignore，用户产物不得再提交。
+- **宿主机直跑注意**：`host.docker.internal` 是给容器内访问宿主机用的；宿主机自己解析它依赖 Docker Desktop 运行或 `C:\Windows\System32\drivers\etc\hosts` 的条目（该条目可能被注释）。解析失效时 `go run .` 表现为 `no such host` 或 TCP 通但握手被掐——临时把三个地址改 `127.0.0.1` 测试，**提交里保持 `host.docker.internal`**（docker 部署需要）。
+- 初始化顺序有依赖（`main.go`）：InitConfig → InitMysql → models.Migrate（AutoMigrate 同步表结构）→ InitRedis → utils.InitSnowflake(`snowflake.workerId`) → models.StartColdWriter → InitKafka（生产者，内含 ensureTopic）→ StartKafkaConsumer（消费者）。时间轮 `utils.TW` 和 UDP 监听（3001 端口）由包 `init()` 自动启动，不在 main 里显式出现。
+- **优雅停机**（SIGINT/SIGTERM）：HTTP `srv.Shutdown` → `utils.CloseKafka`（停消费循环、关读写端）→ `models.StopColdWriter`（排空冷队列、落完最后一批，同步等待最长 10s）。新增需要收尾的后台组件时，按此顺序挂接。
 
 ## 架构与核心链路
 
@@ -35,12 +37,19 @@ main.go → router/app.go（路由注册）→ service/*（HTTP controller，Swa
 
 ### 消息主链路（核心，跨 message.go / hub.go / kafka.go / timewheel.go）
 
-1. 客户端连 `/chat?userId=x`（唯一 WS 入口）→ 创建 `Node`，注册进分片 Hub，起 `sendProc` / `recvProc` 两个 goroutine。
-2. `recvProc` 收到帧后解析 JSON：`Type==3` 是心跳（业务层 JSON 消息，不是 WS ping 帧），只刷新时间轮任务并 `continue`；其余交给 `dispatch`（Type 1=私聊，2=群聊，群聊查 contact 表拿成员逐个下发）。
+1. 客户端连 `/chat?userId=x&token=y`（唯一 WS 入口；token 为登录签发的 Redis 会话，见"鉴权会话"）→ 创建 `Node`，注册进分片 Hub，起 `sendProc` / `recvProc` 两个 goroutine。
+2. `recvProc` 收到帧后解析 JSON：`Type==3` 是心跳（业务层 JSON 消息，不是 WS ping 帧），只 `TouchToken` 续会话 + 刷新时间轮任务并 `continue`；其余交给 `dispatch`（Type 1=私聊，2=群聊，群聊查 contact 表拿成员逐个下发）。
 3. `sendMsg` 两阶段投递：
    - **阶段一（内存，低延迟）**：`WsHub.GetHub(目标)` → `send` channel → 目标 `DataQueue` → `sendProc` 写 WS。
    - **阶段二（异步，可靠性）**：投 Kafka topic `chat_messages`（Async 生产者）→ 消费者组消费 → `models.persistMessage` 冷热双层落存储（见"消息冷热存储"）。系统提示语（如欢迎语）走 `deliverLocal`（仅内存分发，**不进 Kafka/持久化**，历史上曾以纯文本污染 `msg_0_0` key）。
    - 两阶段顺序不可调换、不可省略阶段二：注释标明设计意图是"先瞬间送达，再异步落盘，进程崩溃不丢消息"。
+
+### 鉴权会话（`utils/auth.go`，P0 新增）
+
+- 登录（`models.FindUserByNameAndPwd`）签发 32-hex `crypto/rand` token：`login:token:{t}` = userId（TTL `auth.tokenTTLHours`，缺省 24h），并登记到 `login:user:{uid}` 集合；token 回写 `user_basic.identity`，前端 `/toChat?token=` 一路带到 `/chat`。
+- `/chat` 握手**在 Upgrade 之前**校验 `utils.ValidateToken(token, userId)`，失败回 401 不升级连接；心跳帧（Type=3）调 `TouchToken` 滑动续期（token 与会话集合一起）。
+- `models.UpdateUser` 调 `DropUserSessions` 撤销该用户全部会话（强制重新登录；已建立的 WS 不受影响，只挡新连接）。
+- Redis key 命名空间：`login:*`（鉴权）、`user_info:*`（缓存）、`msg_*`（热层消息）互不冲突，新增鉴权相关 key 请保持 `login:` 前缀。
 
 ### 分片 Hub 与 Node 生命周期（`models/hub.go`，改动前必读）
 
@@ -58,11 +67,13 @@ main.go → router/app.go（路由注册）→ service/*（HTTP controller，Swa
 
 - `user_info:{id}`：用户缓存。读路径为 Cache-Aside + `"null"` 占位 60s 防穿透 + `singleflight` 防击穿（见 `FindUserById`）；写路径为延时双删——先删缓存 → 改库 → 时间轮挂 500ms 后第二删 + 异步重建（见 `UpdateUser`）。改用户缓存逻辑须保持这套组合完整。
 - `msg_{小id}_{大id}`：热层会话 ZSet，member 为原始 JSON 字节流（避免重新序列化），score 为雪花 ID。**key 唯一来源是 `models/store.go` 的 `convKeyOf`（与冷层 `conv_key` 列同值），禁止再手拼 `msg_` 前缀 key**。
-- **消息冷热存储（`models/store.go`）**：消费者回调 `persistMessage` 一次 Pipeline 完成 热层 ZAdd+修剪到 `storage.hotKeep` 条+滑动过期 `storage.hotTTLDays` 天，随后投入 `coldCh` 由 `StartColdWriter` 批量 `CreateInBatches` 写 MySQL `message` 表（主键 id = 雪花 ID = 热层 score；OnConflict DoNothing 保证重放幂等；channel 满则反压消费宁慢勿丢）。读接口两条：`/user/redisMsg` 只读热层——**响应列表在 `Total` 字段**（`RespOkList(w,"ok",res)` 的 Rows/Total 错位是 foot.html 依赖的历史契约，勿改）；`/user/historyMsg` 冷层游标分页（`beforeId`+`size`，返回结构体列表在 `Rows`，用末行 id 翻下页）。已知局限：群消息以 (发送者, 群id) 归入同一热/冷 key，全体成员回读群历史尚未实现。
+- **消息冷热存储（`models/store.go`）**：消费者回调 `persistMessage` 一次 Pipeline 完成 热层 ZAdd+修剪到 `storage.hotKeep` 条+滑动过期 `storage.hotTTLDays` 天，随后投入 `coldCh` 由 `StartColdWriter` 批量 `CreateInBatches` 写 MySQL `message` 表（主键 id = 雪花 ID = 热层 score；OnConflict DoNothing 保证重放幂等，冲突跳过行数低于批次大小时打【警告】；channel 满则反压消费宁慢勿丢；停机由 `StopColdWriter` 同步排空落完）。读接口两条：`/user/redisMsg` 只读热层——**响应列表在 `Total` 字段**（`RespOkList(w,"ok",res)` 的 Rows/Total 错位是 foot.html 依赖的历史契约，勿改）；`/user/historyMsg` 冷层游标分页（`beforeId`+`size`，返回结构体列表在 `Rows`，用末行 id 翻下页）。已知局限：群消息以 (发送者, 群id) 归入同一热/冷 key，全体成员回读群历史尚未实现。
 
 ### 雪花 ID（`utils/snowflake.go`）
 
 刻意做成 **53 bit**（41 时间戳 + 5 机器码 + 7 序列），以同时兼容 JS `Number.MAX_SAFE_INTEGER` 和 Redis ZSet 的 float64 score。**不要拓宽任何一段位数的占比**，否则前端精度丢失、ZSet score 碰撞。
+
+- `main.go` 显式 `InitSnowflake(viper.GetInt64("snowflake.workerId"))`（0~31）。**多实例部署必须逐实例配置不同 workerId**，否则同毫秒撞 ID → 冷存主键冲突被跳过（cold writer 的【警告】日志就是抓这个的）。P1 规划引入会话级 seq 双轨（排序/游标用 seq、幂等键用雪花 msgId）。
 
 ### 数据模型约定
 

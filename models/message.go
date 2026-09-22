@@ -38,6 +38,7 @@ func (table *Message)TableName()string{
 
 type Node struct {
 	UserId        int64
+	Token         string          //登录会话 token（心跳时给 Redis 会话滑动续期）
 	Conn          *websocket.Conn //连接
 	FirstTime     uint64          //首次连接时间
 	LoginTime     uint64          //登录时间
@@ -53,6 +54,12 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 	query:=request.URL.Query()
 	Id:=query.Get("userId")
 	userId,_:=strconv.ParseInt(Id,10,64)
+	//鉴权：握手升级前校验登录会话 token（未登录/伪造 userId 的连接直接拒绝）
+	token := query.Get("token")
+	if !utils.ValidateToken(token, userId) {
+		http.Error(writer, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	isvalida:=true
 	conn,err:=(&websocket.Upgrader{
 		//token校验
@@ -69,6 +76,7 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 	//4.userid和node绑定并加锁
 	node := &Node{
 		UserId:        userId,
+		Token:         token,
 		Conn:          conn,
 		DataQueue:     make(chan []byte, 1024),
 		GroupSets:     set.New(set.ThreadSafe),
@@ -143,6 +151,8 @@ func recvProc(node *Node) {
 
 		// 心跳
 		if msg.Type == 3 {
+			// 在线即续期登录会话（token 与用户会话集合一起滑动过期）
+			utils.TouchToken(node.Token, node.UserId)
 			// 将心跳延迟任务 O(1) 刷新到时间轮对应的未来槽位
 			delay := time.Duration(viper.GetInt("timeout.DelayHeartbeat")) * time.Second
 			if delay <= 0 {

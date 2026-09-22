@@ -17,8 +17,13 @@ storage:
   coldFlushMs: 200    # 冷存储批量落盘最长等待毫秒
 timeout:
   DelayHeartbeat: 60   #延迟心跳时间  单位秒
+auth:
+  tokenTTLHours: 24    #登录会话 token 有效期（小时），心跳在线期间滑动续期
+snowflake:
+  workerId: 1          #雪花机器码(0~31)，多实例部署必须各不相同，重复会导致冷存主键冲突丢消息
 port:
   server: "0.0.0.0:8081"
   udp: 3001
 upload:
   path: "./asset/upload"
+  maxSizeMB: 10        #单文件上传大小上限(MB)

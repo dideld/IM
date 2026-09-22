@@ -47,10 +47,10 @@ func FindUserByNameAndPwd(name string,pass_word string) *UserBasic{
 	user := &UserBasic{}
 	utils.DB.Where("name = ? and pass_word= ?", name, pass_word).First(&user)
 
-	//token加密
-	str := fmt.Sprintf("%d", time.Now().Unix())
-	temp := utils.MD5Encode(str)
-	utils.DB.Model(&user).Where("id = ?", user.ID).Update("identity", temp)
+	//签发登录会话 token（Redis 会话，WS 握手校验、可撤销），回写 identity 字段供前端携带
+	token := utils.IssueToken(user.ID)
+	utils.DB.Model(&user).Where("id = ?", user.ID).Update("identity", token)
+	user.Identity = token
 	// fmt.Println("登录查到的用户:>>>>>>>>>>>>", user)
 	return user
 }
@@ -159,6 +159,9 @@ func UpdateUser(user UserBasic) *gorm.DB {
 		data, _ := json.Marshal(userData)
 		utils.Red.Set(context.Background(), cacheKey, data, time.Hour)
 	})
+
+	// 4. 资料/密码变更即撤销该用户全部登录会话，强制重新登录（新 WS 连接需重新过 /chat 鉴权）
+	utils.DropUserSessions(user.ID)
 
 	return db
 }

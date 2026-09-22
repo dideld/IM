@@ -36,6 +36,12 @@ type coldRecord struct {
 
 var coldCh = make(chan coldRecord, 8192)
 
+// coldStop 关闭后冷存 worker 排空队列、落完最后一批再退出（优雅停机）
+var coldStop chan struct{}
+
+// coldDone 由 worker 在完成最终 flush 退出前 close，供停机方同步等待
+var coldDone chan struct{}
+
 func cfgInt(key string, def int) int {
 	if v := viper.GetInt(key); v > 0 {
 		return v
@@ -92,6 +98,8 @@ func persistMessage(msgData []byte) {
 // StartColdWriter 冷存储批量落盘 worker：攒够 coldBatchSize 条或等 coldFlushMs 毫秒即写 MySQL
 // 必须在 utils.InitMysql() 之后、Kafka 消费者启动之前调用
 func StartColdWriter() {
+	coldStop = make(chan struct{})
+	coldDone = make(chan struct{})
 	batchSize := cfgInt("storage.coldBatchSize", 100)
 	flush := time.Duration(cfgInt("storage.coldFlushMs", 200)) * time.Millisecond
 
@@ -105,10 +113,14 @@ func StartColdWriter() {
 				return
 			}
 			// 主键冲突时跳过（Kafka 重放/重启后至少一次投递，落库需幂等）
-			err := utils.DB.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(batch, batchSize).Error
-			if err != nil {
+			res := utils.DB.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(batch, batchSize)
+			if res.Error != nil {
 				// 整批失败只记日志不重试（至少一次语义下可容忍极少量缺口，换取消费不被卡死）
-				fmt.Println("cold persist MySQL batch failed, size:", len(batch), "err:", err)
+				fmt.Println("cold persist MySQL batch failed, size:", len(batch), "err:", res.Error)
+			} else if res.RowsAffected < int64(len(batch)) {
+				// 冲突跳过的行要大声告警：多实例 workerId 重复或 Kafka 重放会在这里丢消息
+				fmt.Printf("【警告】冷存储 %d/%d 条主键冲突被跳过：检查多实例 snowflake.workerId 是否重复！\n",
+					int64(len(batch))-res.RowsAffected, len(batch))
 			}
 			batch = batch[:0]
 		}
@@ -122,10 +134,39 @@ func StartColdWriter() {
 				}
 			case <-ticker.C:
 				flushBatch()
+			case <-coldStop:
+				// 排空在途队列后做最后一次落盘再退出（宁慢勿丢）
+				for {
+					select {
+					case rec := <-coldCh:
+						batch = append(batch, rec.msg)
+						if len(batch) >= batchSize {
+							flushBatch()
+						}
+					default:
+						flushBatch()
+						fmt.Println("cold writer stopped, final flush done")
+						close(coldDone)
+						return
+					}
+				}
 			}
 		}
 	}()
 	fmt.Println("cold writer started, batchSize:", batchSize, "flushInterval:", flush)
+}
+
+// StopColdWriter 通知冷存 worker 排空并落完最后一批，阻塞至其真正退出（最长 10s）
+func StopColdWriter() {
+	if coldStop == nil {
+		return
+	}
+	coldStop <- struct{}{} // 与 worker 握手：它能收到即意味着它将开始收尾
+	select {
+	case <-coldDone:
+	case <-time.After(10 * time.Second):
+		fmt.Println("【警告】cold writer 收尾超时，可能有在途消息未落库")
+	}
 }
 
 // LoadHistory 冷层游标分页读取：按 conv_key 取 id < beforeId 的最近 size 条（id 降序）
