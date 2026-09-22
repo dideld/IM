@@ -185,35 +185,88 @@ func FindUserByNameAndPwd(c *gin.Context){
 	})
 }
 func RedisMsg(c *gin.Context){
+	convId := c.PostForm("convId")
 	userIdA, _ := strconv.Atoi(c.PostForm("userIdA"))
 	userIdB, _ := strconv.Atoi(c.PostForm("userIdB"))
+	if convId == "" {
+		// 兼容旧参数：无 convId 时按私聊双向归一化推导
+		if userIdA == 0 || userIdB == 0 {
+			utils.RespFail(c.Writer, "参数错误：需要 convId 或 userIdA/userIdB")
+			return
+		}
+		convId = models.ConvIdPrivate(int64(userIdA), int64(userIdB))
+	}
 	start, _ := strconv.Atoi(c.PostForm("start"))
 	end, _ := strconv.Atoi(c.PostForm("end"))
 	isRev, _ := strconv.ParseBool(c.PostForm("isRev"))
-	res := models.RedisMsg(int64(userIdA), int64(userIdB), int64(start), int64(end), isRev)
+	res := models.RedisMsg(convId, int64(start), int64(end), isRev)
 	utils.RespOkList(c.Writer, "ok", res)
 }
 // HistoryMsg
 // @Tags 消息模块
-// @Summary 读取冷层历史消息（MySQL 游标分页）
-// @param userIdA formData string false "用户A"
-// @param userIdB formData string false "用户B（群聊传群ID）"
-// @param beforeId formData string false "游标：只取ID小于该条的消息，0=从最新开始"
+// @Summary 读取冷层历史消息（convId+seq 游标分页）
+// @param convId formData string true "会话id：私聊 p_{小}_{大}（或 userIdA/userIdB）、群聊 g_{群id}"
+// @param beforeSeq formData string false "游标：只取 seq 小于该值的消息，0=从最新开始"
 // @param size formData string false "条数，默认20，最大100"
 // @Produce json
 // @Success 200 {string} json{"code"，"message"}
 // @Router /user/historyMsg [post]
 func HistoryMsg(c *gin.Context){
-	userIdA, _ := strconv.Atoi(c.PostForm("userIdA"))
-	userIdB, _ := strconv.Atoi(c.PostForm("userIdB"))
-	beforeId, _ := strconv.ParseInt(c.PostForm("beforeId"), 10, 64)
+	convId := c.PostForm("convId")
+	beforeSeq, _ := strconv.ParseInt(c.PostForm("beforeSeq"), 10, 64)
+	if beforeSeq == 0 {
+		// 兼容旧参数名 beforeId（语义已变为 seq）
+		beforeSeq, _ = strconv.ParseInt(c.PostForm("beforeId"), 10, 64)
+	}
 	size, _ := strconv.Atoi(c.PostForm("size"))
-	if userIdA == 0 || userIdB == 0 {
+	if convId == "" {
+		userIdA, _ := strconv.Atoi(c.PostForm("userIdA"))
+		userIdB, _ := strconv.Atoi(c.PostForm("userIdB"))
+		if userIdA > 0 && userIdB > 0 {
+			convId = models.ConvIdPrivate(int64(userIdA), int64(userIdB))
+		}
+	}
+	if convId == "" {
+		utils.RespFail(c.Writer, "参数错误：需要 convId")
+		return
+	}
+	list := models.LoadHistory(convId, beforeSeq, size)
+	utils.RespOkList(c.Writer, list, len(list))
+}
+
+// MarkRead
+// @Tags 消息模块
+// @Summary 打开会话即已读（清未读并记录seq游标）
+// @param userId formData string true "用户id"
+// @param convId formData string true "会话id"
+// @Produce json
+// @Success 200 {string} json{"code"，"message"}
+// @Router /user/markRead [post]
+func MarkRead(c *gin.Context){
+	userId, _ := strconv.ParseInt(c.PostForm("userId"), 10, 64)
+	convId := c.PostForm("convId")
+	if userId <= 0 || convId == "" {
 		utils.RespFail(c.Writer, "参数错误")
 		return
 	}
-	list := models.LoadHistory(int64(userIdA), int64(userIdB), beforeId, size)
-	utils.RespOkList(c.Writer, list, len(list))
+	models.MarkRead(userId, convId)
+	utils.RespOk(c.Writer, 0, "已读")
+}
+
+// UnreadList
+// @Tags 消息模块
+// @Summary 全部会话未读数
+// @param userId formData string true "用户id"
+// @Produce json
+// @Success 200 {string} json{"code"，"message"}
+// @Router /user/unreadList [post]
+func UnreadList(c *gin.Context){
+	userId, _ := strconv.ParseInt(c.PostForm("userId"), 10, 64)
+	if userId <= 0 {
+		utils.RespFail(c.Writer, "参数错误")
+		return
+	}
+	utils.RespOk(c.Writer, models.UnreadMap(userId), "ok")
 }
 func SearchFriends(c *gin.Context){
 	id,_:=strconv.Atoi(c.Request.FormValue("userId"))

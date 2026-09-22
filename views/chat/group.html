@@ -10,6 +10,8 @@
                 <img class="mui-media-object mui-pull-left avatar" :src="item.Img ||'/asset/images/avatar0.png'">
                 <div class="mui-media-body">
                     <span v-text="item.Name+'('+item.ID+')'"></span>
+                    <span v-if="unreadOf('g_'+item.ID)" class="mui-badge mui-badge-danger"
+                          v-text="unreadOf('g_'+item.ID) > 99 ? '99+' : unreadOf('g_'+item.ID)"></span>
                     <p class='mui-ellipsis' v-text="item.Desc"></p>
                 </div>
             </a>

@@ -1,9 +1,11 @@
 package models
 
-// 消息冷热存储层：
-//   热层 = Redis ZSet（单会话最近 N 条，滑动 TTL，低延迟历史读取 /user/redisMsg）
-//   冷层 = MySQL message 表（全量归档，按 conv_key+雪花id 游标分页 /user/historyMsg）
-// 二者共享 convKeyOf 的会话 key 归一化规则，冷层主键 id 即热层 ZSet score。
+// 消息冷热存储与会话状态层：
+//   会话 convId：私聊 "p_{小id}_{大id}"、群聊 "g_{群id}"（convIdOf 是唯一来源），
+//   热层/冷层/未读数/事件推送共用，杜绝用户id与群id串号。
+//   热层 = Redis ZSet（score = 会话级递增 seq，单会话修剪 + 滑动 TTL）
+//   冷层 = MySQL message 表（主键 id = 雪花 msgId，(conv_key, seq) 唯一，游标分页）
+//   未读 = Redis HASH unread:{uid}（field=convId），markRead 清除并记录 read 游标
 
 import (
 	"context"
@@ -19,19 +21,35 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// convKeyOf 会话 key 归一化的唯一来源：热层 ZSet key 与冷层 conv_key 列同值
-func convKeyOf(a, b int64) string {
-	x, y := strconv.FormatInt(a, 10), strconv.FormatInt(b, 10)
-	if a > b {
+// convIdOf 会话 id 生成的唯一来源（前端 foot.html 有镜像实现，改这里必须同步改）
+func convIdOf(msgType int, userId int64, targetId int64) string {
+	if msgType == 2 {
+		return "g_" + strconv.FormatInt(targetId, 10)
+	}
+	return convIdPrivate(userId, targetId)
+}
+
+// convIdPrivate 私聊双向归一化 key
+func convIdPrivate(a, b int64) string {
+	x, y := a, b
+	if x > y {
 		x, y = y, x
 	}
-	return "msg_" + x + "_" + y
+	return "p_" + strconv.FormatInt(x, 10) + "_" + strconv.FormatInt(y, 10)
 }
+
+// ConvIdPrivate 供读接口做 userIdA/userIdB → convId 的兼容推导
+func ConvIdPrivate(a, b int64) string { return convIdPrivate(a, b) }
+
+const (
+	seqKeyPrefix    = "seq:"
+	unreadKeyPrefix = "unread:"
+	readKeyPrefix   = "read:"
+)
 
 // coldRecord 冷存储待写队列元素
 type coldRecord struct {
 	msg Message
-	raw []byte // 出错日志用的原始字节
 }
 
 var coldCh = make(chan coldRecord, 8192)
@@ -49,35 +67,40 @@ func cfgInt(key string, def int) int {
 	return def
 }
 
-// persistMessage Kafka 消费者回调：热层（Redis ZSet 修剪+TTL）+ 冷层（MySQL 批量落盘队列）
+// persistMessage Kafka 消费者回调：发 seq → 热层 → 冷层 → 未读维护与事件推送
 func persistMessage(msgData []byte) {
 	jsonMsg := Message{}
-	// 非 JSON（如欢迎语等系统提示误入链路）直接跳过，防止污染会话 key（历史上 msg_0_0 就是这么来的）
+	// 非 JSON（系统提示语等误入链路）直接跳过，防止污染会话 key（历史上 msg_0_0 就是这么来的）
 	if err := json.Unmarshal(msgData, &jsonMsg); err != nil {
 		fmt.Println("persistMessage skip invalid payload:", err)
 		return
 	}
 
-	key := convKeyOf(int64(jsonMsg.UserId), jsonMsg.TargetId)
+	convId := convIdOf(jsonMsg.Type, int64(jsonMsg.UserId), jsonMsg.TargetId)
 	msgId := utils.GenSnowflakeId()
+	ctx := context.Background()
 
-	// 热层：一次 Pipeline 往返完成 写入+修剪+滑动过期
+	// 会话级严格递增 seq（INCR 原子；消费者是当前唯一写入点）
+	seq, err := utils.Red.Incr(ctx, seqKeyPrefix+convId).Result()
+	if err != nil {
+		fmt.Println("seq INCR failed, skip persist:", convId, err)
+		return
+	}
+
+	// 热层：一次 Pipeline 完成 写入(score=seq)+修剪+滑动过期
 	hotKeep := int64(cfgInt("storage.hotKeep", 200))
 	ttl := time.Duration(cfgInt("storage.hotTTLDays", 7)) * 24 * time.Hour
-	ctx := context.Background()
 	pipe := utils.Red.Pipeline()
 	// 保留最原生字节流做 Member，避免重新序列化的 CPU 损耗
-	pipe.ZAdd(ctx, key, redis.Z{Score: float64(msgId), Member: msgData})
-	// 修剪到最近 hotKeep 条（未超限时为空操作）
-	pipe.ZRemRangeByRank(ctx, key, 0, -(hotKeep + 1))
-	pipe.Expire(ctx, key, ttl)
+	pipe.ZAdd(ctx, convId, redis.Z{Score: float64(seq), Member: msgData})
+	pipe.ZRemRangeByRank(ctx, convId, 0, -(hotKeep + 1))
+	pipe.Expire(ctx, convId, ttl)
 	if _, err := pipe.Exec(ctx); err != nil {
 		fmt.Println("Redis hot persist Error:", err)
 	}
 
 	// 冷层：投入批量落盘队列（channel 满则反压消费协程，宁慢勿丢）
 	coldCh <- coldRecord{
-		raw: msgData,
 		msg: Message{
 			Model:      gorm.Model{ID: uint(msgId)},
 			UserId:     jsonMsg.UserId,
@@ -90,9 +113,75 @@ func persistMessage(msgData []byte) {
 			Url:        jsonMsg.Url,
 			Desc:       jsonMsg.Desc,
 			Amount:     jsonMsg.Amount,
-			ConvKey:    key,
+			Seq:        seq,
+			ConvKey:    convId,
 		},
 	}
+
+	// 未读数：私聊给接收方；群聊给除发送者外的全体成员
+	if jsonMsg.Type == 2 {
+		members := SearchUserByGroupId(uint(jsonMsg.TargetId))
+		targets := make([]int64, 0, len(members))
+		for _, m := range members {
+			if int64(m) != int64(jsonMsg.UserId) {
+				targets = append(targets, int64(m))
+			}
+		}
+		pushUnread(convId, seq, targets)
+	} else if jsonMsg.TargetId != int64(jsonMsg.UserId) {
+		pushUnread(convId, seq, []int64{jsonMsg.TargetId})
+	}
+}
+
+// pushUnread 未读 +1 并向在线用户推送 Type=4 事件
+func pushUnread(convId string, seq int64, uids []int64) {
+	ctx := context.Background()
+	for _, uid := range uids {
+		uk := unreadKeyPrefix + strconv.FormatInt(uid, 10)
+		n, err := utils.Red.HIncrBy(ctx, uk, convId, 1).Result()
+		if err != nil {
+			fmt.Println("unread HIncrBy error:", uk, err)
+			continue
+		}
+		evt, err := json.Marshal(map[string]interface{}{"Type": 4, "ConvId": convId, "Seq": seq, "Unread": n})
+		if err != nil {
+			continue
+		}
+		// 仅内存推送，不落任何存储；离线用户下次 unreadList 拉全量补偿
+		deliverLocal(uid, evt)
+	}
+}
+
+// MarkRead 打开会话即已读：清未读计数并记录 seq 游标（多端同步预留）
+func MarkRead(userId int64, convId string) {
+	if convId == "" {
+		return
+	}
+	ctx := context.Background()
+	pipe := utils.Red.Pipeline()
+	pipe.HDel(ctx, unreadKeyPrefix+strconv.FormatInt(userId, 10), convId)
+	if max, err := utils.Red.Get(ctx, seqKeyPrefix+convId).Result(); err == nil {
+		pipe.Set(ctx, readKeyPrefix+strconv.FormatInt(userId, 10)+":"+convId, max, 0)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		fmt.Println("MarkRead error:", err)
+	}
+}
+
+// UnreadMap 返回 {convId: 未读数}，无数据返回空 map
+func UnreadMap(userId int64) map[string]int64 {
+	out := map[string]int64{}
+	m, err := utils.Red.HGetAll(context.Background(), unreadKeyPrefix+strconv.FormatInt(userId, 10)).Result()
+	if err != nil {
+		fmt.Println("UnreadMap error:", err)
+		return out
+	}
+	for k, v := range m {
+		if n, e := strconv.ParseInt(v, 10, 64); e == nil && n > 0 {
+			out[k] = n
+		}
+	}
+	return out
 }
 
 // StartColdWriter 冷存储批量落盘 worker：攒够 coldBatchSize 条或等 coldFlushMs 毫秒即写 MySQL
@@ -112,7 +201,7 @@ func StartColdWriter() {
 			if len(batch) == 0 {
 				return
 			}
-			// 主键冲突时跳过（Kafka 重放/重启后至少一次投递，落库需幂等）
+			// 主键/唯一索引冲突时跳过（幂等；冲突规模异常会在下方告警暴露）
 			res := utils.DB.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(batch, batchSize)
 			if res.Error != nil {
 				// 整批失败只记日志不重试（至少一次语义下可容忍极少量缺口，换取消费不被卡死）
@@ -169,19 +258,19 @@ func StopColdWriter() {
 	}
 }
 
-// LoadHistory 冷层游标分页读取：按 conv_key 取 id < beforeId 的最近 size 条（id 降序）
-func LoadHistory(userIdA, userIdB int64, beforeId int64, size int) []Message {
-	if size <= 0 {
-		size = 20
+// LoadHistory 冷层游标分页读取：按 conv_key 取 seq < beforeSeq 的最近 size 条（seq 降序）
+func LoadHistory(convId string, beforeSeq int64, size int) []Message {
+	if convId == "" || size <= 0 {
+		return []Message{}
 	}
 	if size > 100 {
 		size = 100
 	}
-	ctxDB := utils.DB.Where("conv_key = ?", convKeyOf(userIdA, userIdB))
-	if beforeId > 0 {
-		ctxDB = ctxDB.Where("id < ?", beforeId)
+	q := utils.DB.Where("conv_key = ?", convId)
+	if beforeSeq > 0 {
+		q = q.Where("seq < ?", beforeSeq)
 	}
 	var list []Message
-	ctxDB.Order("id desc").Limit(size).Find(&list)
+	q.Order("seq desc").Limit(size).Find(&list)
 	return list
 }

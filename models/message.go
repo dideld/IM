@@ -29,7 +29,8 @@ type Message struct {
 	Url string
 	Desc string
 	Amount int //其他数字统计（语音时长等，前端 JSON 字段名即 amount）
-	ConvKey string `gorm:"index"` //冷存储会话键，与热层 ZSet key 同规则（convKeyOf）；InnoDB 二级索引隐含主键，天然支撑 conv_key+id 游标查询
+	Seq     int64  `gorm:"uniqueIndex:uk_conv_seq"` //会话内严格递增序号：排序/游标/未读用（与雪花主键 msgId 双轨）
+	ConvKey string `gorm:"uniqueIndex:uk_conv_seq;index"` //会话id（p_{小}_{大} / g_{群id}），唯一来源 convIdOf；与 Seq 组成复合唯一索引
 
 }
 func (table *Message)TableName()string{
@@ -224,6 +225,9 @@ func dispatch(data []byte){
 		//fmt.Println("dispatch  data :", string(data))
 		sendMsg(int64(msg.TargetId),data)   //私信
 	 case 2:
+		//群消息持久化"一条一份"进 g_{群id}（此前每个收件人扇出重复投 Kafka，会在同一会话落 N 份拷贝）；
+		//实时投递仍按成员逐个内存分发
+		utils.SendMsgToKafka(data)
 		sendGroupMsg(int64(msg.TargetId), data)   //群发
 	// case 3:sendAllMsg()        //广播
 	// case 4:                //其他
@@ -271,17 +275,16 @@ func JoinGroup(userId uint, comId string) (int, string) {
 	}
 }
 
-//获取热层（Redis）缓存里面的消息
-func RedisMsg(userIdA int64, userIdB int64, start int64, end int64, isRev bool) []string {
+//获取热层（Redis）缓存里面的消息，convId 为会话键（convIdOf 规则，见 store.go）
+func RedisMsg(convId string, start int64, end int64, isRev bool) []string {
 	ctx := context.Background()
-	key := convKeyOf(userIdA, userIdB)
 
 	var rels []string
 	var err error
 	if isRev {
-		rels, err = utils.Red.ZRevRange(ctx, key, start, end).Result()
+		rels, err = utils.Red.ZRevRange(ctx, convId, start, end).Result()
 	} else {
-		rels, err = utils.Red.ZRange(ctx, key, start, end).Result()
+		rels, err = utils.Red.ZRange(ctx, convId, start, end).Result()
 	}
 	if err != nil {
 		fmt.Println(err) //没有找到
@@ -300,9 +303,9 @@ func sendGroupMsg(targetId int64,msg []byte ){
 	}
 	userIds :=SearchUserByGroupId(uint(targetId))
 	for i:=0;i<len(userIds);i++{
-		//排除发送者自己
+		//排除发送者自己；仅内存分发（持久化已在 dispatch 里统一做一次）
 		if int64(m.UserId) != int64(userIds[i]){
-			sendMsg(int64(userIds[i]),msg)
+			deliverLocal(int64(userIds[i]),msg)
 		}
 	}
 }

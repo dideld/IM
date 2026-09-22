@@ -37,8 +37,12 @@ func Router() *gin.Engine{
 	r.POST("/attach/upload",service.Upload)
 	//读取热层消息（Redis）
 	r.POST("/user/redisMsg", service.RedisMsg)
-	//读取冷层历史消息（MySQL 游标分页）
+	//读取冷层历史消息（MySQL convId+seq 游标分页）
 	r.POST("/user/historyMsg", service.HistoryMsg)
+	//会话已读（清未读+记录seq游标）
+	r.POST("/user/markRead", service.MarkRead)
+	//全部会话未读数
+	r.POST("/user/unreadList", service.UnreadList)
 	//添加好友
 	//r.GET("/contact/loadfriends",service.LoadFriends)
 	r.POST("/contact/addfriend",service.AddFriend)

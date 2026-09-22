@@ -14,6 +14,8 @@
                 <img class="mui-media-object mui-pull-left avatar" :src="item.Avatar ||'/asset/images/avatar0.png'">
                 <div class="mui-media-body">
                     <span v-text="item.Name"></span>
+                    <span v-if="unreadOf(convIdOf(1, item.ID))" class="mui-badge mui-badge-danger"
+                          v-text="unreadOf(convIdOf(1, item.ID)) > 99 ? '99+' : unreadOf(convIdOf(1, item.ID))"></span>
                     <p class='mui-ellipsis' v-text="item.memo"></p>
                 </div>
             </a>

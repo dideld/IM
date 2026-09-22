@@ -41,7 +41,7 @@ go run test/bench_ws.go         # 2 万连接 WS 压测（独立 main 程序，�
                              │
               models/hub.go   16 分片 Hub（userId%16，每分片独立 goroutine 事件循环，无锁）
               models/message.go  recvProc→dispatch→sendMsg 两阶段投递
-              models/store.go   冷热存储（热:Redis ZSet 修剪+TTL；冷:MySQL 批量幂等落库）
+              models/store.go   会话层：convId(p_/g_) + seq 发号 + 冷热双写 + 未读数/Type4 事件
               utils/timewheel.go 心跳超时 O(1) 踢出 / 缓存延时双删
               utils/kafka.go    异步生产 + 消费组落存储（启动时 ensureTopic 幂等建 topic）
 ```
@@ -57,12 +57,21 @@ go run test/bench_ws.go         # 2 万连接 WS 压测（独立 main 程序，�
 
 登录（`/user/findUserByNameAndPwd`）由服务端签发 32-hex 随机 **会话 token** 存 Redis（`login:token:{t}` = userId，TTL `auth.tokenTTLHours` 缺省 24h），并回写 `user.identity` 供前端携带。`/chat` 在 WebSocket 升级**之前**校验 token，未授权直接 401；心跳帧顺带滑动续期；修改用户资料会撤销该用户全部会话（强制重登）。单机架构下未选 JWT——长连接场景需要服务端可控的撤销/踢线能力，而这 JWT 反而要再引黑名单存储。
 
+### 消息 ID 与会话 seq（双轨模型）
+
+- **convId 会话命名空间**：私聊 `p_{小id}_{大id}`、群聊 `g_{群id}`（唯一来源 `convIdOf`，前端 `foot.html` 有镜像实现）。群成员共享 `g_{群id}`，任何成员都能回读全群历史；也彻底杜绝了旧 `msg_` 体系里用户 id 与群 id 串号的问题。
+- **seq 会话级递增**（Redis `INCR seq:{convId}`，热层 ZSet 的 score）：排序/游标/未读计数全用它——小整数、支持"从第 N 条起增量拉取"、无时钟依赖。
+- **msgId 雪花**（冷层 MySQL 主键）：全局唯一标识，位结构见下节。`(conv_key, seq)` 复合唯一索引保证发号完整性；Kafka 重放的真正投递幂等待后续用 clientMsgId 解决。
+- **未读与已读**：HASH `unread:{uid}` 按会话计数，落库时给接收方（群聊为除发送者外全员）+1 并向在线端推 `Type=4` 事件；前端列表渲染红点，打开会话调 `/user/markRead` 清零并记录 seq 游标（`read:{uid}:{convId}`，多端同步预留）。
+
 ### 消息读取接口
 
 | 接口 | 存储层 | 语义 |
 |---|---|---|
-| `POST /user/redisMsg` | Redis 热层 | `start/end` 下标分页（历史契约：列表在响应 `Total` 字段，前端依赖，勿改） |
-| `POST /user/historyMsg` | MySQL 冷层 | `beforeId`（雪花ID游标，0=最新）+ `size` 翻页，列表在 `Rows` |
+| `POST /user/redisMsg` | Redis 热层 | `convId`（兼容 userIdA/B 推导），`start/end` 下标分页（历史契约：列表在响应 `Total` 字段） |
+| `POST /user/historyMsg` | MySQL 冷层 | `convId + beforeSeq`（游标，0=最新）+ `size` 翻页，列表在 `Rows`（含 Seq） |
+| `POST /user/unreadList` | Redis | 全部会话未读数 `{convId: count}` |
+| `POST /user/markRead` | Redis | 清会话未读 + 写 seq 已读游标 |
 
 ## 消息 ID：53-bit 雪花算法
 
@@ -78,7 +87,7 @@ go run test/bench_ws.go         # 2 万连接 WS 压测（独立 main 程序，�
 - **纪元**：自定义 `epoch = 2024-01-01 00:00:00 UTC`，41 bit 毫秒可用约 69 年（至 2093）
 - **机器码 5 bit**：最多 32 节点；**序列 7 bit**：单机每毫秒最多 128 个，用完自旋等下一毫秒
 - **配置**：`main.go` 启动时以 `snowflake.workerId`（0~31）显式初始化，**多实例部署必须逐实例配不同值**——撞 ID 会表现为冷存主键冲突跳过（cold writer 有【警告】日志）
-- **落点**：冷层 MySQL 主键 `id` 显式写入此 ID；热层 ZSet 的 `score` 即同一 ID，因此冷层游标 `beforeId` 与热层 score 天然同序可互通
+- **落点**：冷层 MySQL 主键 `id` 显式写入此 ID（全局唯一标识）；**会话排序/游标改用 seq 双轨**（见上节），热层 score 不再是雪花
 - **约束**：任何一段位数都不得拓宽，否则前端精度丢失 / score 碰撞
 
 ## 目录结构
@@ -103,11 +112,13 @@ test/          bench_ws.go 压测     docs/  swag 生成物
 ## 已知局限与后续规划
 
 已完成（P0）：WS 鉴权（Redis 会话 token）、雪花 workerId 配置化 + 主键冲突告警、优雅停机（冷队列排空）、上传白名单/大小校验。
+已完成（P1）：会话实体化（convId `p_`/`g_` 命名空间）、seq 双轨（排序/游标/未读）、群历史全员统一回读、未读红点+打开即已读+在线 Type=4 事件。
 
 待做（按优先级）：
 
-- 群消息历史统一回读（会话实体化；顺带引入 会话级 seq 双轨：排序/游标/未读 用 seq，幂等键用雪花 msgId）
-- 未读数与已读标记（`Message.ReadTime` 已预留）、消息幂等去重（clientMsgId）、多端在线
+- HTTP 接口层鉴权（WS 握手已有会话校验，但 `/user/*`、`/contact/*` 仍裸奔：`markRead`/`unreadList` 的 userId 可伪造，统一从 token 解析身份是下一步）
+- 消息幂等去重（clientMsgId，解决 Kafka 至少一次的重放复制）、多端在线（Hub 按设备分叉）
+- 已读回执与 `Message.ReadTime` 落库、群历史下拉翻页（当前群首开只回灌热层首页）
 - 水平扩展（uid→节点路由表 + 跨节点消息转发）、冷存归档分区、Redis 内存治理
 - 口令哈希仍为 MD5+盐（建议 bcrypt）；修改资料接口会把明文密码直写（遗留问题）；日志为裸 fmt.Println、无单元测试
 

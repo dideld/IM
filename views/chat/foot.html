@@ -39,6 +39,7 @@
                 usermap: {},
                 friends: [],
                 communitys: [],
+                unread: {},   //会话未读数 {convId: count}，来源 /user/unreadList + Type=4 事件
                 profile: {
                     avatar: "",
                     nickname: "",
@@ -141,6 +142,7 @@
             created: function () {
                 this.loadfriends();
                 this.loadcommunitys();
+                this.loadUnread();
                 this.loaddoutures();
                 setInterval(this.heartbeat, 10 * 1000);
                 var user = userInfo()
@@ -357,19 +359,49 @@
                 closePanel() {
                     this.panelstat = 'kbord';
                 },
+                // ===== P1 会话/未读 =====
+                convIdOf: function (type, targetId) {
+                    //镜像后端 models/store.go 的 convIdOf：私聊 p_{小}_{大}、群聊 g_{群id}，改动必须两侧同步
+                    targetId = parseInt(targetId);
+                    if (type == 2) { return "g_" + targetId; }
+                    var a = userId(), b = targetId;
+                    return a > b ? ("p_" + b + "_" + a) : ("p_" + a + "_" + b);
+                },
+                currentConvId: function () {
+                    if (this.msgcontext.Type != 1 && this.msgcontext.Type != 2) return "";
+                    return this.convIdOf(this.msgcontext.Type, this.msgcontext.TargetId);
+                },
+                unreadOf: function (convId) {
+                    return this.unread[convId] || 0;
+                },
+                loadUnread: function () {
+                    var that = this;
+                    post("user/unreadList", { userId: userId() }, function (res) {
+                        that.unread = res.Data || {};
+                    })
+                },
+                markRead: function (convId) {
+                    if (!convId) return;
+                    var that = this;
+                    post("user/markRead", { userId: userId(), convId: convId }, function (res) {
+                        Vue.delete(that.unread, convId);
+                    })
+                },
+                // ===== P1 end =====
                 singlemsg: function (user) {
                     this.start = 0;
                     this.end = 9;
                     if (this.isDisable) {
-                        //首次读取某个用户的消息记录
-                        if (this.isReadRedisMsg.filter(item => item === user.ID).length <= 0) {
-                            post("user/redisMsg", { userIdA: userId(), userIdB: user.ID, start: this.start, end: this.end, isRev: false }, function (res) {
+                        var convId = this.convIdOf(1, user.ID);
+                        //首次读取某个会话的消息记录（热层窗口）
+                        if (this.isReadRedisMsg.filter(item => item === convId).length <= 0) {
+                            post("user/redisMsg", { convId: convId, start: this.start, end: this.end, isRev: false }, function (res) {
                                 //循环读取的消息记录 并显示
                                 for (var i in res.Total) {
                                     this.showmsg(user, JSON.parse(res.Total[i]), false, true)
                                 }
                             }.bind(this))
-                            this.isReadRedisMsg.push(user.ID)
+                            this.isReadRedisMsg.push(convId)
                         }
 
                         this.setTimeFlag()
@@ -379,6 +411,7 @@
                         this.otherAvatar = user.Avatar;
                         this.msgcontext.TargetId = parseInt(user.ID);
                         this.msgcontext.Type = 1;
+                        this.markRead(convId)
                         mui('.mui-scroll-wrapper').scroll({
                             scrollY: true, //是否竖向滚动
                             scrollX: false, //是否横向滚动
@@ -388,15 +421,19 @@
                             deceleration: 0.0006, //阻尼系数,系数越小滑动越灵敏
                             bounce: true //是否启用回弹
                         });
-                        //下拉获取历史消息记录
-                        document.querySelector('.mui-scroll-wrapper').addEventListener('scroll', (e) => {
+                        //下拉获取历史消息记录：先解绑上一个会话的监听，防止每次点击都堆叠
+                        var wrapper = document.querySelector('.mui-scroll-wrapper');
+                        if (this._histHandler && wrapper) {
+                            wrapper.removeEventListener('scroll', this._histHandler);
+                        }
+                        this._histHandler = (e) => {
                             let translate = e.target.style?.transform?.match(/translate3d\(\d+px,\s*(\d+)px,\s*(\d+)px\)/i);
                             if (translate && translate.length > 1) {
                                 if (translate[1] > 0 && this.isLoadMore == false) {
                                     this.isLoadMore = true;
                                     this.start = this.end + 1;
                                     this.end = this.end + 2;
-                                    post("user/redisMsg", { userIdA: userId(), userIdB: user.ID, start: this.start, end: this.end, isRev: false }, function (res) {
+                                    post("user/redisMsg", { convId: convId, start: this.start, end: this.end, isRev: false }, function (res) {
                                         //循环读取的消息记录 并显示
                                         for (var i in res.Total) {
                                             this.showmsg(user, JSON.parse(res.Total[i]), true)
@@ -405,20 +442,39 @@
                                             this.isLoadMore = false;
                                         }, 300);
                                     }.bind(this))
-                                    this.isReadRedisMsg.push(user.ID)
                                 }
                             }
-                        })
+                        };
+                        if (wrapper) {
+                            wrapper.addEventListener('scroll', this._histHandler)
+                        }
                     }
                 },
                 //群聊的初始化
                 groupmsg: function (group) {
                     if (this.isDisable) {
+                        this.start = 0;
+                        this.end = 9;
                         this.setTimeFlag()
                         this.win = "group";
                         this.title = group.Name;
                         this.msgcontext.TargetId = parseInt(group.ID);
                         this.msgcontext.Type = 2;
+                        var that = this;
+                        var convId = "g_" + parseInt(group.ID);
+                        //群历史统一回读：全员共享 g_{群id} 一个热层窗口
+                        if (this.isReadRedisMsg.filter(item => item === convId).length <= 0) {
+                            post("user/redisMsg", { convId: convId, start: this.start, end: this.end, isRev: false }, function (res) {
+                                for (var i in res.Total) {
+                                    var msg = JSON.parse(res.Total[i]);
+                                    //成员不在好友缓存时降级占位，不对无路由的 user/find 发请求
+                                    var user = that.usermap["" + msg.userId] || { Name: "未知用户", Avatar: "" };
+                                    that.showmsg(user, msg, false, true)
+                                }
+                            })
+                            this.isReadRedisMsg.push(convId)
+                        }
+                        this.markRead(convId)
                     }
                 },
                 loaduserinfo: function (userid, cb) {
@@ -435,6 +491,15 @@
                     }
                 },
                 onmessage: function (data) {
+                    if (data.Type === 4) {
+                        //未读事件(仅服务端→客户端)：命中当前会话直接清成已读，否则刷新角标；绝不能进 msglist
+                        if (data.ConvId === this.currentConvId()) {
+                            this.markRead(data.ConvId)
+                        } else {
+                            Vue.set(this.unread, data.ConvId, data.Unread)
+                        }
+                        return
+                    }
                     this.loaduserinfo(data.userId, function (user) {
 
                         this.showmsg(user, data)
@@ -468,6 +533,10 @@
                         } else {
                             console.log("recv<==" + evt.data)
                         }
+                    }.bind(this)
+                    //打开成功：补偿断线/离线期间的未读变化
+                    this.webSocket.onopen = function (evt) {
+                        this.loadUnread()
                     }.bind(this)
                     //关闭回调
                     this.webSocket.onclose = function (evt) {
