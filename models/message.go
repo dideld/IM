@@ -11,25 +11,25 @@ import (
 	"webapp/utils"
 
 	"github.com/gorilla/websocket"
-	"github.com/redis/go-redis/v9"
 	"github.com/spf13/viper"
 	"gopkg.in/fatih/set.v0"
 	"gorm.io/gorm"
 )
 
 type Message struct {
-	gorm.Model
+	gorm.Model   // 冷存落库时 ID 主键显式写入雪花ID（53bit，兼容 JS 安全整数与 Redis float64 score）
 	UserId uint //发送者
 	TargetId int64 //接收者
-	Type int //群聊、私聊、广播
+	Type int //1私聊、2群聊、3心跳
 	Media int //消息类型  文字、表情包、图片、音频
 	Content string //消息内容
 	CreateTime uint64 //创建时间
 	ReadTime   uint64 //读取时间
-	Pic string 
+	Pic string
 	Url string
 	Desc string
-	Amoubt int //其他数字统计
+	Amount int //其他数字统计（语音时长等，前端 JSON 字段名即 amount）
+	ConvKey string `gorm:"index"` //冷存储会话键，与热层 ZSet key 同规则（convKeyOf）；InnoDB 二级索引隐含主键，天然支撑 conv_key+id 游标查询
 
 }
 func (table *Message)TableName()string{
@@ -40,21 +40,13 @@ type Node struct {
 	UserId        int64
 	Conn          *websocket.Conn //连接
 	FirstTime     uint64          //首次连接时间
-	HeartbeatTime uint64          //心跳时间
 	LoginTime     uint64          //登录时间
 	DataQueue     chan []byte     //消息
 	GroupSets     set.Interface   //好友 / 群
 	CurrentHub    *Hub    //记录当前的Node属于哪个分片
 }
 
-// //映射关系
-// var clientMap map[int64]*Node =make(map[int64]*Node,0)
-
-// //读写锁
-// var rwLock sync.RWMutex
-
-// 企业级终极架构：集群路由分发 + Kafka 全链路解耦
-// 单机级别的 Go Channel 升级为极其强大的分布式中间件，确保消息永不丢失
+// 消息全链路：内存极速分发（WebSocket 低延迟） + Kafka 异步解耦持久化（冷热存储，见 store.go）
 
 func Chat(writer http.ResponseWriter,request *http.Request){
 	//1.获取参数并校验合法性
@@ -70,7 +62,7 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 	}).Upgrade(writer,request,nil)
 	if err!=nil{
 		fmt.Println(err)
-		return 
+		return
 	}
 	//2.获取conn
 	targetHub:=WsHub.GetHub(userId)
@@ -80,7 +72,6 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 		Conn:          conn,
 		DataQueue:     make(chan []byte, 1024),
 		GroupSets:     set.New(set.ThreadSafe),
-		HeartbeatTime: uint64(time.Now().Unix()),
 		CurrentHub:    targetHub, // 记录分片以便后续注销
 	}
 	targetHub.register <- node
@@ -103,7 +94,8 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 	go sendProc(node)
 	//6.完成接受的逻辑
 	go recvProc(node)
-	sendMsg(userId,[]byte("欢迎进入聊天系统"))
+	//系统提示语只做内存分发，不进入持久化链路
+	deliverLocal(userId,[]byte("欢迎进入聊天系统"))
 }
 func sendProc(node *Node) {
 	for {
@@ -177,9 +169,9 @@ func init() {
 
 }
 
-// StartKafkaConsumer 对外暴露给 main 函数，用于注册消费群组回调
+// StartKafkaConsumer 对外暴露给 main 函数，用于注册消费群组回调（冷热双层持久化）
 func StartKafkaConsumer() {
-	utils.StartKafkaConsumer(saveToRedis)
+	utils.StartKafkaConsumer(persistMessage)
 }
 
 func udpRevProc(){
@@ -199,7 +191,7 @@ func udpRevProc(){
 			fmt.Println(err)
 			return
 		}
-		
+
 		// 分配新内存防止在异步 Worker 处理被缓冲数组下一次 Read 覆盖
 		msgData := make([]byte, n)
 		copy(msgData, buf[0:n])
@@ -229,45 +221,21 @@ func dispatch(data []byte){
 	}
 }
 func sendMsg(userId int64, msgData []byte) {
-	// 【架构重组核心：内存分发零延迟】
-	// 第一阶段：不去管 Redis 等没等，只要收到消息瞬间在万分之一毫秒内送给 Hub 下发给用户，达到极致快。
-	targetHub := WsHub.GetHub(userId)
-	targetHub.send <- &SendRequest{
-		userID: userId,
-		data:   msgData,
-	}
+	// 【架构核心：两阶段投递】
+	// 第一阶段：内存分发零延迟，瞬间送给 Hub 下发给用户。
+	deliverLocal(userId, msgData)
 
-	// 第二阶段：通过微服务架构思维，跨进程投递给外部的高可用 Kafka 集群
-	// 后台 Consumer 消费者组会自动接手这段数据慢慢存入 Redis。哪怕 Go 服务崩溃重启，消息也不会丢！
+	// 第二阶段：通过 Kafka 跨进程投递给消费者组，冷热双层落存储。
+	// 哪怕 Go 服务崩溃重启，消息也不会丢！
 	utils.SendMsgToKafka(msgData)
 }
 
-func saveToRedis(msgData []byte) {
-	jsonMsg := Message{}
-	json.Unmarshal(msgData, &jsonMsg)
-
-	ctx := context.Background()
-	targetIdStr := strconv.Itoa(int(jsonMsg.TargetId))
-	userIdStr := strconv.Itoa(int(jsonMsg.UserId))
-	
-	// 这里不再重新反序列化装填回 msg，那是一个巨大的编解码 CPU 损耗，保留最原生信息直接做 Member
-	var key string
-	if uint(jsonMsg.TargetId) > jsonMsg.UserId {
-		key = "msg_" + userIdStr + "_" + targetIdStr
-	} else {
-		key = "msg_" + targetIdStr + "_" + userIdStr
-	}
-
-	msgId := utils.GenSnowflakeId()
-	score := float64(msgId)
-
-	_, e := utils.Red.ZAdd(ctx, key, redis.Z{
-		Score:  score,
-		Member: msgData, // 直接存字节流，CPU 零损耗
-	}).Result()
-	
-	if e != nil {
-		fmt.Println("Redis ZAdd Error:", e)
+// deliverLocal 仅做内存分发（欢迎语等系统提示使用，不进持久化链路）
+func deliverLocal(userId int64, data []byte) {
+	targetHub := WsHub.GetHub(userId)
+	targetHub.send <- &SendRequest{
+		userID: userId,
+		data:   data,
 	}
 }
 
@@ -293,24 +261,17 @@ func JoinGroup(userId uint, comId string) (int, string) {
 	}
 }
 
-//获取缓存里面的消息
+//获取热层（Redis）缓存里面的消息
 func RedisMsg(userIdA int64, userIdB int64, start int64, end int64, isRev bool) []string {
 	ctx := context.Background()
-	userIdStr := strconv.Itoa(int(userIdA))
-	targetIdStr := strconv.Itoa(int(userIdB))
-	var key string
-	if userIdA > userIdB {
-		key = "msg_" + targetIdStr + "_" + userIdStr
-	} else {
-		key = "msg_" + userIdStr + "_" + targetIdStr
-	}
+	key := convKeyOf(userIdA, userIdB)
 
 	var rels []string
 	var err error
 	if isRev {
-		rels, err = utils.Red.ZRange(ctx, key, start, end).Result()
-	} else {
 		rels, err = utils.Red.ZRevRange(ctx, key, start, end).Result()
+	} else {
+		rels, err = utils.Red.ZRange(ctx, key, start, end).Result()
 	}
 	if err != nil {
 		fmt.Println(err) //没有找到
@@ -320,10 +281,17 @@ func RedisMsg(userIdA int64, userIdB int64, start int64, end int64, isRev bool) 
 
 func sendGroupMsg(targetId int64,msg []byte ){
 	fmt.Println("开始群发消息")
+	//解析发送者：群消息不再回显给发送者本人
+	//（旧代码误拿群 id 与成员 id 比较，导致自己收到自己发的消息并产生 msg_自己_自己 的持久化副本）
+	m := Message{}
+	if err := json.Unmarshal(msg, &m); err != nil {
+		fmt.Println(err)
+		return
+	}
 	userIds :=SearchUserByGroupId(uint(targetId))
 	for i:=0;i<len(userIds);i++{
-		//排除给自己的
-		if targetId!= int64(userIds[i]){
+		//排除发送者自己
+		if int64(m.UserId) != int64(userIds[i]){
 			sendMsg(int64(userIds[i]),msg)
 		}
 	}
@@ -331,13 +299,4 @@ func sendGroupMsg(targetId int64,msg []byte ){
 	//需要重写此方法才能完整的msg转byte[]
 func (msg Message) MarshalBinary() ([]byte, error) {
 	return json.Marshal(msg)
-}
-func (node *Node) IsHeartbeatTimeOut(currentTime uint64)  bool {
-	 return currentTime-node.HeartbeatTime > uint64(viper.GetInt("timeout.DelayHeartbeat"))
-}
-
-	//更新用户心跳
-func (node *Node) Heartbeat(currentTime uint64) {
-	node.HeartbeatTime = currentTime
-	return
 }

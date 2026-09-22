@@ -38,22 +38,30 @@ CREATE TABLE `group_basic` (
   KEY `idx_group_basic_deleted_at` (`deleted_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 
+-- 冷存储消息表（全量归档）：id 显式写入雪花ID（53bit），非自增；落库与读路径见 models/store.go
+-- 旧结构（form_id/target_id longtext）与本 DDL 不兼容；直接跑本脚本会先 DROP 重建，
+-- 也可以在开发库手动 DROP TABLE `message`; 后由服务启动时的 models.Migrate()（AutoMigrate）建表
+DROP TABLE IF EXISTS `message`;
 CREATE TABLE `message` (
-  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+  `id` bigint(20) unsigned NOT NULL,
   `created_at` datetime(3) DEFAULT NULL,
   `updated_at` datetime(3) DEFAULT NULL,
   `deleted_at` datetime(3) DEFAULT NULL,
-  `form_id` longtext,
-  `target_id` longtext,
-  `type` longtext,
+  `user_id` bigint(20) unsigned DEFAULT NULL,
+  `target_id` bigint(20) DEFAULT NULL,
+  `type` bigint(20) DEFAULT NULL,
   `media` bigint(20) DEFAULT NULL,
   `content` longtext,
+  `create_time` bigint(20) unsigned DEFAULT NULL,
+  `read_time` bigint(20) unsigned DEFAULT NULL,
   `pic` longtext,
   `url` longtext,
   `desc` longtext,
   `amount` bigint(20) DEFAULT NULL,
+  `conv_key` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
-  KEY `idx_message_deleted_at` (`deleted_at`)
+  KEY `idx_message_deleted_at` (`deleted_at`),
+  KEY `idx_message_conv_key` (`conv_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 
 CREATE TABLE `user_basic` (

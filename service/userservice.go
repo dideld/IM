@@ -3,21 +3,18 @@ package service
 import (
 	"fmt"
 	"math/rand/v2"
-	"net/http"
 	"strconv"
 	"webapp/models"
 	"webapp/utils"
-	"time"
 	"github.com/asaskevich/govalidator"
 	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
 )
 
 // GetUserList
 // @Tags 用户模块
 // @Summary 所有用户
 // @Produce json
-// @Success 200 {string} json{"code"，"message"} // 修改返回类型
+// @Success 200 {string} json{"code"，"message"} //  修改返回类型
 // @Router /user/getUserList [post]
 func GetUserList(c *gin.Context){
 
@@ -35,8 +32,8 @@ func GetUserList(c *gin.Context){
 // @param name query string flase "用户名"
 // @param password query string flase "密码"
 // @param repassword query string flase "确认密码"
-// @Produce json  
-// @Success 200 {string} json{"code"，"message"} // 修改返回类型
+// @Produce json
+// @Success 200 {string} json{"code"，"message"} //  修改返回类型
 // @Router /user/createUser [post]
 func CreateUser(c *gin.Context){
 	user:=models.UserBasic{}
@@ -91,8 +88,8 @@ func CreateUser(c *gin.Context){
 // @Tags 用户模块
 // @Summary 删除用户
 // @param id query string flase "id"
-// @Produce json  
-// @Success 200 {string} json{"code"，"message"} // 修改返回类型
+// @Produce json
+// @Success 200 {string} json{"code"，"message"} //  修改返回类型
 // @Router /user/deleteUser [delete]
 func DeleteUser(c *gin.Context){
 	user:=models.UserBasic{}
@@ -115,8 +112,8 @@ func DeleteUser(c *gin.Context){
 // @param phone formData string flase "phone"
 // @param avator formData string flase "icon"
 // @param email formData string flase "email"
-// @Produce json  
-// @Success 200 {string} json{"code"，"message"} // 修改返回类型
+// @Produce json
+// @Success 200 {string} json{"code"，"message"} //  修改返回类型
 // @Router /user/updateUser [post]
 func UpdateUser(c *gin.Context){
 	user:=models.UserBasic{}
@@ -135,13 +132,13 @@ func UpdateUser(c *gin.Context){
 			"code":    -1, //  0成功   -1失败
 			"message": "修改参数失败",
 			"data":    user,
-	})
+		})
 	}else{
 			c.JSON(200, gin.H{
 			"code":    0, //  0成功   -1失败
 			"message": "修改用户成功",
 			"data":    user,
-	})
+		})
 	}
 
 }
@@ -151,7 +148,7 @@ func UpdateUser(c *gin.Context){
 // @param name formData string flase "用户名"
 // @param password formData string flase "密码"
 // @Produce json
-// @Success 200 {string} json{"code"，"message"} // 修改返回类型
+// @Success 200 {string} json{"code"，"message"} //  修改返回类型
 // @Router /user/findUserByNameAndPwd [post]
 func FindUserByNameAndPwd(c *gin.Context){
 
@@ -167,8 +164,8 @@ func FindUserByNameAndPwd(c *gin.Context){
 			"code":    -1, //  0成功   -1失败
 			"message": "该用户不存在",
 			"data":    data,
-	})
-	return
+		})
+		return
 	}
 	flag:=utils.ValidPassword(password,user.Salt,user.PassWord)
 	if !flag{
@@ -176,8 +173,8 @@ func FindUserByNameAndPwd(c *gin.Context){
 			"code":    -1, //  0成功   -1失败
 			"message": "密码错误",
 			"data":    data,
-	})
-	return
+		})
+		return
 	}
 	pwd:=utils.MakePassword(password,user.Salt)
 	data=*models.FindUserByNameAndPwd(name,pwd)
@@ -186,27 +183,6 @@ func FindUserByNameAndPwd(c *gin.Context){
 			"message": "登录成功",
 			"data":    data,
 	})
-}
-//防止跨域站点伪造请求
-var upGrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
-func SendMsg(c *gin.Context){
-	ws,err:=upGrader.Upgrade(c.Writer,c.Request,nil)
-	if err!=nil{
-		fmt.Println(err)
-		return
-	}
-	defer func(ws *websocket.Conn){
-		err=ws.Close()
-		if err!=nil{
-		fmt.Println(err)
-		return
-		}	
-	}(ws)
-	MsgHandler(ws,c)
 }
 func RedisMsg(c *gin.Context){
 	userIdA, _ := strconv.Atoi(c.PostForm("userIdA"))
@@ -217,22 +193,27 @@ func RedisMsg(c *gin.Context){
 	res := models.RedisMsg(int64(userIdA), int64(userIdB), int64(start), int64(end), isRev)
 	utils.RespOkList(c.Writer, "ok", res)
 }
-func MsgHandler(ws *websocket.Conn,c *gin.Context){
-	msg,err:=utils.Subscribe(c,utils.PublishKey)
-	if err!=nil{
-		fmt.Println(err)
+// HistoryMsg
+// @Tags 消息模块
+// @Summary 读取冷层历史消息（MySQL 游标分页）
+// @param userIdA formData string false "用户A"
+// @param userIdB formData string false "用户B（群聊传群ID）"
+// @param beforeId formData string false "游标：只取ID小于该条的消息，0=从最新开始"
+// @param size formData string false "条数，默认20，最大100"
+// @Produce json
+// @Success 200 {string} json{"code"，"message"}
+// @Router /user/historyMsg [post]
+func HistoryMsg(c *gin.Context){
+	userIdA, _ := strconv.Atoi(c.PostForm("userIdA"))
+	userIdB, _ := strconv.Atoi(c.PostForm("userIdB"))
+	beforeId, _ := strconv.ParseInt(c.PostForm("beforeId"), 10, 64)
+	size, _ := strconv.Atoi(c.PostForm("size"))
+	if userIdA == 0 || userIdB == 0 {
+		utils.RespFail(c.Writer, "参数错误")
 		return
 	}
-	tm:=time.Now().Format("2006-01-02 15:04:05")
-	m:=fmt.Sprintf("[ws][%s]:%s",tm,msg)
-	err=ws.WriteMessage(1,[]byte(m))
-	if err!=nil{
-		fmt.Println(err)
-	}
-}
-func SendUserMsg(c *gin.Context){
-	models.Chat(c.Writer,c.Request)
-	
+	list := models.LoadHistory(int64(userIdA), int64(userIdB), beforeId, size)
+	utils.RespOkList(c.Writer, list, len(list))
 }
 func SearchFriends(c *gin.Context){
 	id,_:=strconv.Atoi(c.Request.FormValue("userId"))
@@ -248,7 +229,7 @@ func SearchFriends(c *gin.Context){
 func AddFriend(c *gin.Context){
 	userId,_:=strconv.Atoi(c.Request.FormValue("userId"))
 	targetId,_:=strconv.Atoi(c.Request.FormValue("targetId"))
-	
+
 	code:=models.AddFriend(uint(userId),uint(targetId))
 	if code == 0{
 			utils.RespOk(c.Writer,code,"添加成功")

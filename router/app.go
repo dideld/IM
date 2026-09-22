@@ -33,14 +33,12 @@ func Router() *gin.Engine{
 	r.DELETE("/user/deleteUser",service.DeleteUser)
 	r.POST("/user/updateUser",service.UpdateUser)
 	r.POST("/user/findUserByNameAndPwd",service.FindUserByNameAndPwd)
-	//发送消息
-	r.GET("/user/sendMsg",service.SendMsg)
-	//发送消息
-	r.GET("/user/sendUserMsg",service.SendUserMsg)
 	//上传文件
 	r.POST("/attach/upload",service.Upload)
-	//读取消息
+	//读取热层消息（Redis）
 	r.POST("/user/redisMsg", service.RedisMsg)
+	//读取冷层历史消息（MySQL 游标分页）
+	r.POST("/user/historyMsg", service.HistoryMsg)
 	//添加好友
 	//r.GET("/contact/loadfriends",service.LoadFriends)
 	r.POST("/contact/addfriend",service.AddFriend)

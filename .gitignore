@@ -1,0 +1,14 @@
+# 编译产物
+*.exe
+*.exe~
+/main
+
+# 运行时数据（用户上传与本地缓存）
+asset/upload/*
+!asset/upload/.gitkeep
+cache/
+*.log
+
+# IDE / OS
+.idea/
+.DS_Store

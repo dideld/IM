@@ -13,7 +13,9 @@ import (
 func main() {
 	utils.InitConfig()
 	utils.InitMysql()
+	models.Migrate()            // 0. 同步表结构（含 message 冷存储表）
 	utils.InitRedis()
+	models.StartColdWriter()    // 冷存储批量落盘 worker（须在 DB 就绪后、消费者启动前）
 	utils.InitKafka()           // 1. 先初始化 Kafka Producer
 	models.StartKafkaConsumer() // 2. 再挂载消费者监控和持久化存库逻辑
 	go monitor()

@@ -6,12 +6,19 @@ redis:
   DB: 0
   poolSize: 500
   minIdleConn: 100
+kafka:
+  broker: "host.docker.internal:9092"
+  topic: "chat_messages"
+  consumerGroup: "chat_redis_saver_group"
+storage:
+  hotKeep: 200        # Redis 热层单会话保留的最大消息条数（超出修剪最旧的）
+  hotTTLDays: 7       # 热层 ZSet 滑动过期天数
+  coldBatchSize: 100  # MySQL 冷存储批量落盘条数
+  coldFlushMs: 200    # 冷存储批量落盘最长等待毫秒
 timeout:
   DelayHeartbeat: 60   #延迟心跳时间  单位秒
-  HeartbeatHz: 10   #每隔多少秒心跳时间   
-  HeartbeatMaxTime: 3600  #最大心跳时间 ，超过此就下线 
-  RedisOnlineTime: 2  #缓存的在线用户时长   单位H
 port:
   server: "0.0.0.0:8081"
   udp: 3001
-  upload_path: "C:/Users/27177/Desktop/webapp/cache"
+upload:
+  path: "./asset/upload"
