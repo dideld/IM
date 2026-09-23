@@ -29,6 +29,7 @@ type Message struct {
 	Url string
 	Desc string
 	Amount int //其他数字统计（语音时长等，前端 JSON 字段名即 amount）
+	ClientMsgId string `gorm:"size:64"` //客户端生成的幂等键：Kafka 重放/客户端重发时经 Redis 集合去重（persistMessage）
 	Seq     int64  `gorm:"uniqueIndex:uk_conv_seq"` //会话内严格递增序号：排序/游标/未读用（与雪花主键 msgId 双轨）
 	ConvKey string `gorm:"uniqueIndex:uk_conv_seq;index"` //会话id（p_{小}_{大} / g_{群id}），唯一来源 convIdOf；与 Seq 组成复合唯一索引
 
@@ -39,6 +40,7 @@ func (table *Message)TableName()string{
 
 type Node struct {
 	UserId        int64
+	DeviceId      string          //设备标识（前端 sessionStorage 生成）：同用户多端在线，同设备重连替换旧节点
 	Token         string          //登录会话 token（心跳时给 Redis 会话滑动续期）
 	Conn          *websocket.Conn //连接
 	FirstTime     uint64          //首次连接时间
@@ -56,8 +58,9 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 	Id:=query.Get("userId")
 	userId,_:=strconv.ParseInt(Id,10,64)
 	//鉴权：握手升级前校验登录会话 token（未登录/伪造 userId 的连接直接拒绝）
+	//auth.devSkipWSToken 为压测/本地调试专用的 dev-only 开关（默认 false），生产严禁开启
 	token := query.Get("token")
-	if !utils.ValidateToken(token, userId) {
+	if !viper.GetBool("auth.devSkipWSToken") && !utils.ValidateToken(token, userId) {
 		http.Error(writer, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -77,6 +80,7 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 	//4.userid和node绑定并加锁
 	node := &Node{
 		UserId:        userId,
+		DeviceId:      query.Get("deviceId"),
 		Token:         token,
 		Conn:          conn,
 		DataQueue:     make(chan []byte, 1024),

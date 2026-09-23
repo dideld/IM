@@ -49,6 +49,8 @@ func Router() *gin.Engine{
 		authed.POST("/user/markRead", service.MarkRead)
 		//全部会话未读数
 		authed.POST("/user/unreadList", service.UnreadList)
+		//会话对端已读游标（私聊"已读"状态）
+		authed.POST("/user/readStatus", service.ReadStatus)
 		//添加好友
 		//authed.GET("/contact/loadfriends",service.LoadFriends)
 		authed.POST("/contact/addfriend",service.AddFriend)

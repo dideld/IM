@@ -38,6 +38,7 @@
                                 <span v-text="item.msg.amount"></span>
                             </div>
                         </div>
+                        <p class="readflag" v-if="item.ismine && item.read">已读</p>
                     </li>
                 </ul>
             </div>

@@ -55,9 +55,10 @@ main.go → router/app.go（路由注册）→ service/*（HTTP controller，Swa
 
 ### 分片 Hub 与 Node 生命周期（`models/hub.go`，改动前必读）
 
+- 多端在线（P2）：`clients map[int64][]*Node`（uid → 各设备节点），`Node.DeviceId` 来自 `/chat?deviceId=`（前端 sessionStorage 每标签页一个，双开标签页即可测多端）。register 时**同 DeviceId 替换旧节点**（页面刷新重连场景）；`send` 扇出到该用户全部设备；`dropNode` 按**指针身份**只摘自己——背压/心跳只踢单台设备，不影响其余端，也防止误删同设备重建的新连接（同 uid 多端后更不能按 uid 整删）。
 - `HubManager` 固定 16 分片，`userId % 16` 路由；每个 Hub 一个独立 goroutine 事件循环（`Run`），通过 register/unregister/send channel 通信，**无锁**——`clients` map 只允许在所属分片的 `Run` 内触碰，禁止在别的 goroutine 直接读写。
-- `Node` 持有 `CurrentHub`（所属分片）和 `DataQueue`（缓冲 1024）。注销时**必须保留地址比对**（`currentNode == node` 才 delete + close）：防止旧连接的延迟下线事件误删同用户重建的新连接，且防止 double close panic。
-- `DataQueue` 写满时 Hub 直接 `closeNode`（背压踢线），`sendProc` 在队列 close 时主动关 TCP 连接让客户端感知被踢。
+- `Node` 持有 `CurrentHub`（所属分片）和 `DataQueue`（缓冲 1024）；队列满 `dropNode` 单端（close DataQueue 后 sendProc 关该端 TCP，客户端感知被踢）。
+- `/chat` 握手有 dev 开关 `auth.devSkipWSToken`（跳过 token 校验，**仅供 bench_ws 压测，生产严禁开启**）。
 
 ### 时间轮（`utils/timewheel.go`）
 
@@ -70,22 +71,23 @@ main.go → router/app.go（路由注册）→ service/*（HTTP controller，Swa
 - `user_info:{id}`：用户缓存。读路径为 Cache-Aside + `"null"` 占位 60s 防穿透 + `singleflight` 防击穿（见 `FindUserById`）；写路径为延时双删——先删缓存 → 改库 → 时间轮挂 500ms 后第二删 + 异步重建（见 `UpdateUser`）。改用户缓存逻辑须保持这套组合完整。
 - **会话 id（convId，P1 引入）**：私聊 `p_{小id}_{大id}`、群聊 `g_{群id}`，唯一来源 `models/store.go` 的 `convIdOf`——**`views/chat/foot.html` 有它的 JS 镜像实现 `convIdOf`，改 Go 侧必须同步改前端**。热层 ZSet key、冷层 `conv_key` 列、未读 field、Type=4 事件全用它；`msg_` 前缀旧体系已一刀切废弃。
 - `seq:{convId}`：会话级递增序号发号器（`INCR`，消费者是唯一写入点）。**热层 ZSet 的 score = seq**（不再是雪花；53-bit 精度约束现在只剩 msgId 需要）。ZSet 修剪至 `storage.hotKeep` + 滑动 TTL 逻辑不变。
-- **消息冷热存储（`models/store.go`）**：消费者回调 `persistMessage`：发 seq → 热层 Pipeline → 投 `coldCh` 由 `StartColdWriter` 批量 `CreateInBatches`（主键 id=雪花 msgId，`(conv_key, seq)` 复合唯一索引 `uk_conv_seq`；OnConflict DoNothing + 冲突跳过计数【警告】；停机由 `StopColdWriter` 同步排空）。
-- **未读数与已读**：HASH `unread:{uid}`（field=convId）由 `pushUnread` 累加（私聊给接收方；群聊给除发送者外全体成员），随后向在线用户 `deliverLocal` 推 `Type=4` 事件 `{"Type":4,"ConvId","Seq","Unread"}`——**仅服务端→客户端**，前端 `onmessage` 必须在 `loaduserinfo` 之前拦截该帧（否则会对无 userId 的帧发无效 HTTP 并污染 msglist）。`markRead` 清计数并写游标 `read:{uid}:{convId}`；`unreadList` 供前端开页/重连拉全量。
-- 读接口三条（全部经 X-Token 会话鉴权 + `ConvHasMember` 成员校验）：`/user/redisMsg` 热层（`convId` 参数，兼容 userIdA/B 推导；**响应列表在 `Total` 字段的前端契约勿改**）；`/user/historyMsg` 冷层（`convId + beforeSeq + size`，Rows 含 Seq，末行 seq 翻下页）；`/user/markRead`、`/user/unreadList`（身份取会话，表单 userId 被忽略）。
+- **消息冷热存储（`models/store.go`）**：消费者回调 `persistMessage`：clientMsgId 去重（`cm:{convId}` SET 近窗判重，超 2×hotKeep 随机淘汰，远期靠主键冲突兜底）→ 发 seq → 热层 Pipeline → 投 `coldCh` 由 `StartColdWriter` 批量 `CreateInBatches`（主键 id=雪花 msgId，`(conv_key, seq)` 复合唯一索引 `uk_conv_seq`；OnConflict DoNothing + 冲突跳过计数【警告】；停机由 `StopColdWriter` 同步排空）。
+- **未读、已读与回执**：HASH `unread:{uid}`（field=convId）由 `pushUnread` 累加（私聊给接收方；群聊给除发送者外全体成员），向在线端推 `Type=4` 事件 `{"Type":4,"ConvId","Seq","Unread"}`。`MarkRead`：清未读 + Redis 游标 + **`user_read_cursor` 表 upsert 落库**（markRead 频率低，同步写可接受，上量再改批量 channel）；**私聊**回填对端消息 `read_time` 并向对方在线设备推 `Type=5` 回执 `{"Type":5,"ConvId","ReadSeq","Reader"}`；群聊只记成员水位（逐条全员回执留后续）。前端 `readStatus` 接口 + `convReadSeq` 驱动气泡"已读"。事件帧 **仅服务端→客户端**，前端 `onmessage` 必须在 `loaduserinfo` 之前拦截 Type=4/5（否则无效 HTTP + 污染 msglist）。
+- 读接口四条（全部经 X-Token 会话鉴权 + `ConvHasMember` 成员校验）：`/user/redisMsg` 热层（`convId` 参数，兼容 userIdA/B 推导；**响应列表在 `Total` 字段的前端契约勿改**）；`/user/historyMsg` 冷层（`convId + beforeSeq + size`，Rows 含 Seq，末行 seq 翻下页）；`/user/markRead`、`/user/unreadList`、`/user/readStatus`（身份取会话，表单 userId 被忽略）。
 
 ### 雪花 ID（`utils/snowflake.go`）
 
 刻意做成 **53 bit**（41 时间戳 + 5 机器码 + 7 序列），以同时兼容 JS `Number.MAX_SAFE_INTEGER` 和 Redis ZSet 的 float64 score。**不要拓宽任何一段位数的占比**，否则前端精度丢失、ZSet score 碰撞。
 
-- `main.go` 显式 `InitSnowflake(viper.GetInt64("snowflake.workerId"))`（0~31）。**多实例部署必须逐实例配置不同 workerId**，否则同毫秒撞 ID → 冷存主键冲突被跳过（cold writer 的【警告】日志就是抓这个的）。P1 已引入会话级 seq 双轨：排序/游标/未读用 seq，msgId（雪花）仍是冷层主键与全局唯一标识；真正的投递幂等去重（clientMsgId）仍未做，留后续。
+- `main.go` 显式 `InitSnowflake(viper.GetInt64("snowflake.workerId"))`（0~31）。**多实例部署必须逐实例配置不同 workerId**，否则同毫秒撞 ID → 冷存主键冲突被跳过（cold writer 的【警告】日志就是抓这个的）。seq 双轨：排序/游标/未读用 seq，msgId（雪花）是冷层主键与全局唯一标识；投递幂等由 clientMsgId（P2）承担。
 
 ### 数据模型约定
 
 - 所有表用 `gorm.Model`（软删除 `deleted_at`），启动时 `models.Migrate()` AutoMigrate 同步结构，建表脚本 `sql/init_ginchat.sql` 是快照（其中 message 段含 DROP 重建，见下）。
 - `message` 表为冷存储全量归档：主键 id 显式写入雪花 ID（非自增），另有 `seq`（会话内递增号）与 `conv_key`，`(conv_key, seq)` 复合唯一。旧 DDL（form_id/target_id longtext）与新结构不兼容，开发库需先 `DROP TABLE message;` 一次。
 - `Contact.Type`：1=好友（**双向各存一行**，增删须成对处理，见 `AddFriend`/`DeleteFriend`），2=群成员关系（owner_id=用户，target_id=群）。
-- `Message.Type`：1 私聊 / 2 群聊 / 3 心跳 / 4 未读事件（**仅服务端→客户端**，客户端若回发 Type=4 会走 dispatch 无匹配分支被无害忽略）；`Media`：文字、表情、图片、音频；`Amount`（原拼写错误字段 `Amoubt` 已改名，改后前端 `amount` JSON 才真正绑定得上）。
+- `Message.Type`：1 私聊 / 2 群聊 / 3 心跳 / 4 未读事件 / 5 已读回执（**4、5 仅服务端→客户端**，客户端若回发会走 dispatch 无匹配分支被无害忽略）；`Media`：文字、表情、图片、音频；`Amount`（原拼写错误字段 `Amoubt` 已改名，改后前端 `amount` JSON 才真正绑定得上）；`ClientMsgId`：客户端幂等键（`genMsgId()` 生成）。
+- `user_read_cursor` 表：`(user_id, conv_key)` 唯一，`last_seq` 为已读水位——Redis `read:` 游标的持久账本。
 
 ### 已清理的遗留路径
 

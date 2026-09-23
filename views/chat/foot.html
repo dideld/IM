@@ -40,6 +40,13 @@
                 friends: [],
                 communitys: [],
                 unread: {},   //会话未读数 {convId: count}，来源 /user/unreadList + Type=4 事件
+                convReadSeq: {},   //私聊对端已读游标 {convId: readSeq}，来源 /user/readStatus + Type=5 回执
+                deviceId: (function () {
+                    // sessionStorage 使每个浏览器标签页独立成"一台设备"，双开标签页即可联调多端在线
+                    var d = sessionStorage.getItem("deviceId");
+                    if (!d) { d = "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); sessionStorage.setItem("deviceId", d); }
+                    return d;
+                })(),
                 profile: {
                     avatar: "",
                     nickname: "",
@@ -240,6 +247,10 @@
                 createmsgcontext: function () {
                     return JSON.parse(JSON.stringify(this.msgcontext))
                 },
+                genMsgId: function () {
+                    //客户端幂等键：Kafka 重放/误点重发在服务端去重（persistMessage）
+                    return "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+                },
                 loaddoutures: function () {
                     var res = [];
                     var config = this.doutu.config;
@@ -273,6 +284,10 @@
                     var data = {
                     }
                     data.ismine = userId() == msg.userId;
+                    //渲染时已知对端游标则直接标记"已读"（历史回灌与实时同一路径）
+                    if (data.ismine && (this.convReadSeq[this.currentConvId()] || 0) > 0) {
+                        data.read = true
+                    }
                     //console.log(data.ismine,userId(),msg.userid)
                     data.user = user;
                     data.msg = msg;
@@ -318,6 +333,7 @@
                         var msg = this.createmsgcontext();
                         msg.Media = 1;
                         msg.Content = txt;
+                        msg.clientMsgId = this.genMsgId();
                         if (msg.Type == 1) {
                             this.showmsg(userInfo(), msg);
                         }
@@ -332,6 +348,7 @@
                         var msg = this.createmsgcontext();
                         msg.Media = 4;
                         msg.url = picurl;
+                        msg.clientMsgId = this.genMsgId();
                         if (msg.Type == 1) {
                             this.showmsg(userInfo(), msg);
                         }
@@ -346,6 +363,7 @@
                         msg.Media = 3;
                         msg.url = url;
                         msg.amount = num;
+                        msg.clientMsgId = this.genMsgId();
                         if (msg.Type == 1) {
                             this.showmsg(userInfo(), msg);
                         }
@@ -386,6 +404,22 @@
                     post("user/markRead", { userId: userId(), convId: convId }, function (res) {
                         Vue.delete(that.unread, convId);
                     })
+                    //拉对端已读游标：私聊气泡回填"已读"状态
+                    post("user/readStatus", { convId: convId }, function (res) {
+                        if (res.Data && res.Data.readSeq > 0) {
+                            that.convReadSeq[convId] = res.Data.readSeq
+                            if (that.currentConvId() === convId) { that.markMineAsRead() }
+                        }
+                    })
+                },
+                markMineAsRead: function () {
+                    var that = this;
+                    this.msglist.forEach(function (it) {
+                        //回执语义：该会话中我先发的全部气泡均已读（游标以服务端为准，UI 不逐条对账 seq）
+                        if (it.ismine && !it.read && it.msg.Type == that.msgcontext.Type && it.msg.TargetId == that.msgcontext.TargetId) {
+                            Vue.set(it, "read", true)
+                        }
+                    });
                 },
                 bindHistHandler: function (convId, resolve) {
                     //下拉获取历史消息记录（私聊/群聊共用）：先解绑上一个会话的监听，防止每次点击堆叠
@@ -498,6 +532,14 @@
                     }
                 },
                 onmessage: function (data) {
+                    if (data.Type === 5) {
+                        //私聊已读回执：记录游标；命中当前会话则把我此前发的气泡标"已读"
+                        this.convReadSeq[data.ConvId] = data.ReadSeq
+                        if (data.ConvId === this.currentConvId()) {
+                            this.markMineAsRead()
+                        }
+                        return
+                    }
                     if (data.Type === 4) {
                         //未读事件(仅服务端→客户端)：命中当前会话直接清成已读，否则刷新角标；绝不能进 msglist
                         if (data.ConvId === this.currentConvId()) {
@@ -529,7 +571,7 @@
 
                 },
                 initwebsocket: function () {
-                    var url = "ws://" + location.host + "/chat?userId=" + userId() + "&token=" + util.parseQuery("token");
+                    var url = "ws://" + location.host + "/chat?userId=" + userId() + "&token=" + util.parseQuery("token") + "&deviceId=" + this.deviceId;
                     this.webSocket = new WebSocket(url);
                     //消息处理
                     this.webSocket.onmessage = function (evt) {

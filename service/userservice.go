@@ -283,6 +283,22 @@ func MarkRead(c *gin.Context){
 	utils.RespOk(c.Writer, 0, "已读")
 }
 
+// ReadStatus
+// @Tags 消息模块
+// @Summary 会话对端已读游标（私聊气泡"已读"状态）
+// @param convId formData string true "会话id"
+// @Produce json
+// @Success 200 {string} json{"code"，"message"}
+// @Router /user/readStatus [post]
+func ReadStatus(c *gin.Context){
+	convId := c.PostForm("convId")
+	if convId == "" || !models.ConvHasMember(convId, authUid(c)) {
+		utils.RespFail(c.Writer, "参数错误")
+		return
+	}
+	utils.RespOk(c.Writer, gin.H{"convId": convId, "readSeq": models.PeerReadSeq(convId, authUid(c))}, "ok")
+}
+
 // UnreadList
 // @Tags 消息模块
 // @Summary 全部会话未读数

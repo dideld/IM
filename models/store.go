@@ -81,6 +81,15 @@ func persistMessage(msgData []byte) {
 	msgId := utils.GenSnowflakeId()
 	ctx := context.Background()
 
+	// clientMsgId 幂等去重：Kafka 重放 / 客户端重发直接整体跳过。
+	// 去重集随会话维护，超过 2×hotKeep 时随机淘汰——只承诺"近期窗口"内的重放去重（远期重复靠主键冲突兜底）。
+	if jsonMsg.ClientMsgId != "" {
+		if has, err := utils.Red.SIsMember(ctx, "cm:"+convId, jsonMsg.ClientMsgId).Result(); err == nil && has {
+			fmt.Println("persistMessage skip duplicate clientMsgId:", jsonMsg.ClientMsgId)
+			return
+		}
+	}
+
 	// 会话级严格递增 seq（INCR 原子；消费者是当前唯一写入点）
 	seq, err := utils.Red.Incr(ctx, seqKeyPrefix+convId).Result()
 	if err != nil {
@@ -96,8 +105,20 @@ func persistMessage(msgData []byte) {
 	pipe.ZAdd(ctx, convId, redis.Z{Score: float64(seq), Member: msgData})
 	pipe.ZRemRangeByRank(ctx, convId, 0, -(hotKeep + 1))
 	pipe.Expire(ctx, convId, ttl)
+	if jsonMsg.ClientMsgId != "" {
+		ck := "cm:" + convId
+		pipe.SAdd(ctx, ck, jsonMsg.ClientMsgId)
+		pipe.Expire(ctx, ck, ttl)
+	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		fmt.Println("Redis hot persist Error:", err)
+	}
+	if jsonMsg.ClientMsgId != "" {
+		// 近似淘汰超窗的去重集（随机弹出可接受：被弹条目若重放，落到冷层靠 msgId 冲突/告警兜底）
+		ck := "cm:" + convId
+		if n, err := utils.Red.SCard(ctx, ck).Result(); err == nil && n > 2*hotKeep {
+			utils.Red.SPopN(ctx, ck, n-2*hotKeep)
+		}
 	}
 
 	// 冷层：投入批量落盘队列（channel 满则反压消费协程，宁慢勿丢）
@@ -116,6 +137,7 @@ func persistMessage(msgData []byte) {
 			Amount:     jsonMsg.Amount,
 			Seq:        seq,
 			ConvKey:    convId,
+			ClientMsgId: jsonMsg.ClientMsgId,
 		},
 	}
 
@@ -186,20 +208,110 @@ func ConvHasMember(convId string, uid int64) bool {
 	return false
 }
 
-// MarkRead 打开会话即已读：清未读计数并记录 seq 游标（多端同步预留）
+// ReadCursor 会话已读游标落库表（Redis read: 键的持久账本；群聊回执的水位模型）
+type ReadCursor struct {
+	gorm.Model
+	UserId  uint   `gorm:"uniqueIndex:uk_user_conv"`
+	ConvKey string `gorm:"uniqueIndex:uk_user_conv;size:64"`
+	LastSeq int64
+}
+
+func (table *ReadCursor) TableName() string {
+	return "user_read_cursor"
+}
+
+// convPeer 私聊 key "p_a_b" 取对端（非私聊或不含该用户返回 0）
+func convPeer(convId string, uid int64) int64 {
+	if !strings.HasPrefix(convId, "p_") {
+		return 0
+	}
+	parts := strings.Split(convId[2:], "_")
+	if len(parts) != 2 {
+		return 0
+	}
+	a, e1 := strconv.ParseInt(parts[0], 10, 64)
+	b, e2 := strconv.ParseInt(parts[1], 10, 64)
+	if e1 != nil || e2 != nil {
+		return 0
+	}
+	if a == uid {
+		return b
+	}
+	if b == uid {
+		return a
+	}
+	return 0
+}
+
+// MarkRead 打开会话即已读：
+//  1. Redis 游标 + 清未读；2. 游标 upsert 落库；
+//  3. 私聊回填对方消息的 read_time（群聊只记成员水位，逐条全员回执留后续）；
+//  4. 私聊向对端在线设备推 Type=5 已读回执事件。
+//
+// markRead 频率低（开会话/收到新消息时），同步写库可接受；若上量改走独立批量 channel。
 func MarkRead(userId int64, convId string) {
 	if convId == "" {
 		return
 	}
 	ctx := context.Background()
+	max, _ := utils.Red.Get(ctx, seqKeyPrefix+convId).Result()
+
 	pipe := utils.Red.Pipeline()
 	pipe.HDel(ctx, unreadKeyPrefix+strconv.FormatInt(userId, 10), convId)
-	if max, err := utils.Red.Get(ctx, seqKeyPrefix+convId).Result(); err == nil {
+	if max != "" {
 		pipe.Set(ctx, readKeyPrefix+strconv.FormatInt(userId, 10)+":"+convId, max, 0)
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		fmt.Println("MarkRead error:", err)
 	}
+	if max == "" {
+		return // 该会话还没有消息，无游标可存
+	}
+	seq, _ := strconv.ParseInt(max, 10, 64)
+
+	// 游标落库（复合唯一 user_id+conv_key，冲突则前移）
+	err := utils.DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "user_id"}, {Name: "conv_key"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{"last_seq": seq, "updated_at": time.Now()}),
+	}).Create(&ReadCursor{UserId: uint(userId), ConvKey: convId, LastSeq: seq}).Error
+	if err != nil {
+		fmt.Println("read cursor upsert failed:", err)
+	}
+
+	// 私聊：把游标之前、对方发给我的消息回填 read_time
+	if strings.HasPrefix(convId, "p_") {
+		res := utils.DB.Model(&Message{}).
+			Where("conv_key = ? AND seq > 0 AND seq <= ? AND user_id <> ? AND read_time = 0", convId, seq, userId).
+			Update("read_time", time.Now().UnixMilli())
+		if res.Error != nil {
+			fmt.Println("read_time backfill failed:", res.Error)
+		}
+		// 对端在线则推已读回执事件（多端扇出自动覆盖其所有设备）
+		if peer := convPeer(convId, userId); peer > 0 {
+			evt, err := json.Marshal(map[string]interface{}{"Type": 5, "ConvId": convId, "ReadSeq": seq, "Reader": userId})
+			if err == nil {
+				deliverLocal(peer, evt)
+			}
+		}
+	}
+}
+
+// PeerReadSeq 会话对端的已读游标（私聊气泡"已读"状态用）：Redis 优先，缺则回落 DB
+func PeerReadSeq(convId string, uid int64) int64 {
+	peer := convPeer(convId, uid)
+	if peer <= 0 {
+		return 0
+	}
+	ctx := context.Background()
+	if v, err := utils.Red.Get(ctx, readKeyPrefix+strconv.FormatInt(peer, 10)+":"+convId).Result(); err == nil {
+		n, _ := strconv.ParseInt(v, 10, 64)
+		return n
+	}
+	var rc ReadCursor
+	if err := utils.DB.Where("user_id = ? AND conv_key = ?", peer, convId).First(&rc).Error; err == nil {
+		return rc.LastSeq
+	}
+	return 0
 }
 
 // UnreadMap 返回 {convId: 未读数}，无数据返回空 map

@@ -1,3 +1,6 @@
+// WS 压测：go run test/bench_ws.go
+// 前置：P0 起 /chat 握手校验会话 token——压测请在 config/app.yml 设 auth.devSkipWSToken: true
+// （dev-only 开关，跳过 WS 鉴权，生产严禁开启），或为压测账号批量签发真实 token。
 package main
 
 import (
@@ -61,6 +64,7 @@ func connect(userId int, rate int) {
 	q := u.Query()
 	q.Set("userId", strconv.Itoa(userId))
 	q.Set("token", "test")
+	q.Set("deviceId", strconv.Itoa(userId)+"-bench") //每连接唯一设备号，适配多端在线 Hub
 	u.RawQuery = q.Encode()
 
 	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)

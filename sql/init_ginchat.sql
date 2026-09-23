@@ -59,9 +59,26 @@ CREATE TABLE `message` (
   `desc` longtext,
   `amount` bigint(20) DEFAULT NULL,
   `conv_key` varchar(64) DEFAULT NULL,
+  `seq` bigint DEFAULT NULL,
+  `client_msg_id` varchar(64) DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_message_deleted_at` (`deleted_at`),
-  KEY `idx_message_conv_key` (`conv_key`)
+  KEY `idx_message_conv_key` (`conv_key`),
+  UNIQUE KEY `uk_conv_seq` (`conv_key`,`seq`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+-- 会话已读游标（Redis read: 键的持久账本；私聊 read_time 回填与 Type=5 回执依据）
+CREATE TABLE `user_read_cursor` (
+  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+  `created_at` datetime(3) DEFAULT NULL,
+  `updated_at` datetime(3) DEFAULT NULL,
+  `deleted_at` datetime(3) DEFAULT NULL,
+  `user_id` bigint(20) unsigned DEFAULT NULL,
+  `conv_key` varchar(64) DEFAULT NULL,
+  `last_seq` bigint DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_user_conv` (`user_id`,`conv_key`),
+  KEY `idx_user_read_cursor_deleted_at` (`deleted_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 
 CREATE TABLE `user_basic` (
