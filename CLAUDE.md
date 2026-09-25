@@ -20,7 +20,8 @@ go run test/bench_ws.go         # WS 压测（2 万连接），独立 main 程�
 
 ## 运行前提与配置坑
 
-- 依赖 MySQL / Redis / Kafka。所有地址均在 `config/app.yml`（含 `kafka.broker/topic/consumerGroup`）；代码里带本地开发默认值回退（缺键也能起服务，回退 `host.docker.internal`）。
+- 依赖 MySQL / Redis / Kafka。地址默认值在 `config/app.yml`（含 `kafka.*`/`storage.*`/`auth.*`/`upload.*`）；**viper AutomaticEnv 支持环境变量覆盖**（`mysql.dns`→`MYSQL_DNS` 等，env 优先于文件）——宿主机直跑连 127.0.0.1 用 env 注入，**不要为临时测试改提交 yml**。
+- **一键全栈**：`docker-compose up -d --build` 起 MySQL+Redis+Kafka+go_app+Nginx（compose 里 go_app 用 env 指向容器服务名；中间件端口只绑 127.0.0.1，MySQL 对外 13306 避开宿主机原生实例；Kafka 双监听器 INTERNAL `kafka:9092` / HOST `localhost:9092`）。依赖镜像拉取需宿主机代理在线（Docker 配了 127.0.0.1:7890）。
 - 上传目录走 `upload.path`（缺省 `./asset/upload`，不存在自动创建），单文件上限 `upload.maxSizeMB`（缺省 10MB，`MaxBytesReader` 硬限）；扩展名白名单在 `service/attach.go`（图片+音频，白名单外拒绝——该目录被 Nginx 直接托管）。`asset/upload/` 与 `cache/` 已 gitignore，用户产物不得再提交。
 - **宿主机直跑注意**：`host.docker.internal` 是给容器内访问宿主机用的；宿主机自己解析它依赖 Docker Desktop 运行或 `C:\Windows\System32\drivers\etc\hosts` 的条目（该条目可能被注释）。解析失效时 `go run .` 表现为 `no such host` 或 TCP 通但握手被掐——临时把三个地址改 `127.0.0.1` 测试，**提交里保持 `host.docker.internal`**（docker 部署需要）。
 - 初始化顺序有依赖（`main.go`）：InitConfig → InitMysql → models.Migrate（AutoMigrate 同步表结构）→ InitRedis → utils.InitSnowflake(`snowflake.workerId`) → models.StartColdWriter → InitKafka（生产者，内含 ensureTopic）→ StartKafkaConsumer（消费者）。时间轮 `utils.TW` 和 UDP 监听（3001 端口）由包 `init()` 自动启动，不在 main 里显式出现。

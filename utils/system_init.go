@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	//"webapp/models"
@@ -25,6 +26,10 @@ func InitConfig() {
 	if err!=nil{
 		fmt.Println(err)
 	}
+	// 环境变量覆盖（优先级高于配置文件）：docker-compose 用 MYSQL_DNS/REDIS_ADDR/KAFKA_BROKER 等
+	// 指向容器网络内的服务名，同一份 app.yml 宿主机直跑与容器部署互不改文件
+	viper.AutomaticEnv()
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	fmt.Println("config app:",viper.Get("app"))
 	fmt.Println("config mysql:",viper.Get("mysql"))
 

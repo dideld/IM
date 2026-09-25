@@ -81,6 +81,12 @@ func persistMessage(msgData []byte) {
 	msgId := utils.GenSnowflakeId()
 	ctx := context.Background()
 
+	// 压测流量开关：bench- 前缀的消息可整体跳过存储（Kafka 收发链路仍真实走一遍，
+	// 但不占 Redis/MySQL——避免压测在开发库堆垃圾行）。skipBenchPersist 默认 false，压测配置里显式开启。
+	if viper.GetBool("storage.skipBenchPersist") && strings.HasPrefix(jsonMsg.ClientMsgId, "bench-") {
+		return
+	}
+
 	// clientMsgId 幂等去重：Kafka 重放 / 客户端重发直接整体跳过。
 	// 去重集随会话维护，超过 2×hotKeep 时随机淘汰——只承诺"近期窗口"内的重放去重（远期重复靠主键冲突兜底）。
 	if jsonMsg.ClientMsgId != "" {

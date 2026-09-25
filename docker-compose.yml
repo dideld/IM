@@ -1,20 +1,104 @@
+# 一键全栈：docker-compose up -d --build
+# MySQL(建库+初始SQL) + Redis + Kafka(KRaft) + go_app + Nginx，容器网络互通。
+# go_app 用环境变量(MYSQL_DNS/REDIS_ADDR/KAFKA_BROKER/UPLOAD_PATH)覆盖 app.yml
+# （viper AutomaticEnv：env 优先级高于配置文件），同一份 yml 宿主机直跑与容器部署共存。
+# 入口：http://localhost/（Nginx 托管静态+反代含 WS Upgrade）；:8081 直连仅调试。
+# 中间件端口只绑 127.0.0.1（MySQL 映射 13306 避开宿主机原生 3306）；
+# 宿主机手动跑 go run 时可用 env 直连：REDIS_ADDR=127.0.0.1:6379 KAFKA_BROKER=127.0.0.1:9092 MYSQL_DNS="root:111111@tcp(127.0.0.1:13306)/ginchat?..."
+# 密码为本地开发默认值，换环境请整体替换。
 
 services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: "111111"
+      MYSQL_DATABASE: ginchat
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./sql/init_ginchat.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "127.0.0.1:13306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p111111"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: bitnami/redis:latest   # 免拉新镜像亦可；换 redis:7-alpine 需配 REDIS_PASSWORD_* 或 ALLOW_EMPTY_PASSWORD
+    environment:
+      ALLOW_EMPTY_PASSWORD: "yes"
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  kafka:
+    image: apache/kafka:3.9.0
+    environment:
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_NODE_ID: "1"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      # 双监听器：容器间走 INTERNAL(kafka:9092)，宿主机调试走 HOST(localhost:9092)
+      KAFKA_LISTENERS: "INTERNAL://:9092,HOST://:29092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,HOST://localhost:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,HOST:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: claudeComposeKfk0000001
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    ports:
+      - "127.0.0.1:9092:29092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
   go_app:
     build:
       context: .
       dockerfile: dockfile
+    environment:
+      MYSQL_DNS: "root:111111@tcp(mysql:3306)/ginchat?charset=utf8mb4&parseTime=True&loc=Local"
+      REDIS_ADDR: "redis:6379"
+      KAFKA_BROKER: "kafka:9092"
+      UPLOAD_PATH: "/data/upload"
+    volumes:
+      - app_upload:/data/upload
     ports:
-      - "8081:8081" # 映射给宿主机供调试使用（可选）
+      - "8081:8081"  # 调试直连（生产走 Nginx 可去掉）
+    depends_on:
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
     restart: always
 
   nginx_web:
     image: nginx:alpine
     ports:
       - "80:80"
-    volumes: # 生产环境常挂载宿主机目录，也可在 nginx container build 里 COPY 进去
+    volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ./asset:/usr/share/nginx/html/asset:ro
+      # 上传件从共享卷提供（嵌套挂载覆盖只读 asset 下同名子目录）
+      - app_upload:/usr/share/nginx/html/asset/upload:ro
     depends_on:
       - go_app
     restart: always
+
+volumes:
+  mysql_data:
+  redis_data:
+  kafka_data:
+  app_upload:

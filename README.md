@@ -17,17 +17,18 @@
 
 ### 依赖
 
-- Go 1.25；MySQL 8（执行 `sql/init_ginchat.sql` 初始化，`message` 冷存表也可留空由启动时 AutoMigrate 生成）
-- Redis、Kafka（单机即可；地址全部配置在 `config/app.yml`，代码含默认值回退）
-- 注意：`host.docker.internal` 仅在 Docker 容器内可靠指向宿主机；宿主机直接 `go run .` 时若连不上（`no such host` 或握手被断），把配置里三个地址改为 `127.0.0.1`，或取消 `C:\Windows\System32\drivers\etc\hosts` 中对应注释行
+- **一键全栈（推荐，零本地依赖）**：`docker-compose up -d --build` 一次拉起 MySQL(自动建库+初始SQL) + Redis + Kafka(KRaft) + go_app + Nginx；打开 `http://localhost/` 注册即用。数据在命名卷（`mysql_data`/`app_upload`），`docker-compose down -v` 整体重置。
+- 手动模式（宿主机 `go run .` 调试用）：自备 MySQL/Redis/Kafka——本机已有原生 MySQL 时，compose 里中间件**不发布宿主端口**，两者可共存。
+- 配置优先级：**环境变量 > `config/app.yml`**（viper AutomaticEnv：`mysql.dns`→`MYSQL_DNS`、`redis.addr`→`REDIS_ADDR`、`kafka.broker`→`KAFKA_BROKER`、`port.server`→`PORT_SERVER`、`upload.path`→`UPLOAD_PATH`）。compose 靠 env 指向容器服务名，宿主机直跑不用改文件。
+- 注意：`host.docker.internal` 只在容器内可靠指向宿主机；宿主机直连失败（`no such host`/握手被掐）时改用 env `REDIS_ADDR=127.0.0.1:6379` 等，别改提交文件。
 - 多实例部署：为每个实例配置不同的 `snowflake.workerId`（0~31）
 
 ### 运行
 
 ```bash
-go run .                        # 宿主机直跑，监听 0.0.0.0:8081
-docker-compose up --build       # 部署栈：nginx(:80) → go_app(:8081)，/asset 由 Nginx 托管
-go run test/bench_ws.go         # 2 万连接 WS 压测（独立 main 程序，仓库无单元测试）
+docker-compose up -d --build    # 一键全栈，入口 http://localhost/
+go run .                        # 宿主机直跑（自备中间件），监听 0.0.0.0:8081
+go run test/bench_ws.go -clients 5000 -rate 4   # WS 压测 v2（前置开关见文件头）
 ```
 
 浏览器访问 `http://localhost/`（compose）或 `http://localhost:8081/` 注册登录。
@@ -114,23 +115,35 @@ test/          bench_ws.go 压测     docs/  swag 生成物
 
 ## 性能与压测
 
-压测入口：`go run test/bench_ws.go`（2 万连接 × 每人每秒 8 条 ≈ 16 万消息级；前置 `auth.devSkipWSToken: true` 跳过 WS 鉴权，生产严禁）。
+压测入口：`go run test/bench_ws.go -clients 20000 -rate 8`（v2）。服务端前置（压测完记得关）：`auth.devSkipWSToken: true`（跳过 WS 鉴权，dev-only）+ `storage.skipBenchPersist: true`（`bench-` 前缀消息跳过冷热存储——否则一次压测会在开发库堆上百万垃圾行）。
+
+**v2 已落地**（v1 数据不可信的原因，均已修复）：
+
+| 修正 | v1 的问题 |
+|---|---|
+| Type=3 心跳（与消息同一发送协程交替，规避并发写） | 无心跳 → 60s 后被时间轮全量踢线，"在线 2 万"是假数 |
+| 发送帧补 `UserId` | 缺失 → 落库生成 `p_0_{uid}` 垃圾会话 |
+| 端到端时延直方图（P50/P90/P99/Max，每 10s 摘要） | 只数包不算时延 |
+| `clientMsgId=bench-*` + skipBenchPersist 开关 | 压测流量污染 Redis/MySQL |
+| 断连即时减在线数 | successConn 只增不减 |
+
+**仍未覆盖（出全量报告前须知）**：① 流量模型仍是"私聊发给自己"，测不到跨用户/群扇出成本——群消息是放大器（1 条 = N 设备扇出 + N 未读 HINCR + N 事件 + Kafka + 热层 + 冷队列），需先批量造社交图谱数据（addfriend/createCommunity/joinGroup）再按 7:2:1 混流；② 慢消费者单端被踢专项；③ 单机 2 万连接时压测客户端自身 fd/CPU 先到瓶颈，正式结论需多机打流。
 
 **分层指标（SLO 建议基线）**
 
 | 层 | 指标 | 采集方式 | 基线 |
 |---|---|---|---|
-| 连接层 | 建连速率/耗时、并发连接数 | bench 日志 | 2万连接 < 30s，失败率 0 |
-| 消息层 | **端到端延迟 P50/P99**（发送→接收） | 见下"延迟直方图" | P99 < 200ms |
+| 连接层 | 建连速率/耗时、并发连接数 | bench monitor | 2万连接 < 30s，失败率 0 |
+| 消息层 | **端到端延迟 P50/P99**（发送→接收） | bench 内置时延直方图（v2） | P99 < 200ms |
 | 消息层 | 服务端 QPS、各分片连接均衡度 | 内置 monitor + `ClientCount` 分片计数 | 分片偏差 < 2× |
 | 持久层 | 落库滞后（发送→冷层可见） | Type=4 事件的 Seq 对时 或 kafka lag | < 5s |
 | 持久层 | Kafka consumer lag | `kafka-consumer-groups.sh --describe` | 稳定期不增长 |
 | 进程层 | goroutine / GC / 内存 | `/debug/pprof/*` 压测中 30s 采样 | goroutine ≈ 连接数×2+常数 |
 
-**扩展 bench 的三个关键改造**（当前只测吞吐，不测时延）：
-1. **延迟直方图**：发送时记 `clientMsgId + 本地时间`，接收端按 `clientMsgId` 配对算单跳时延，HDR 桶输出 P50/P99/P999——现有原子计数器只能算"总包数/秒"。
-2. **流量模型贴近真实**：按 7:2:1 混入私聊:群聊:心跳，群规模 3~200 人——群消息是成本放大器（1 条 = 扇出 N 设备 + N 次未读 HINCR + N 个 Type=4 事件 + 1 次 Kafka + 1 次热层 + 冷队列入队），峰值 QPS 上限基本由群占比决定。
-3. **慢消费者专项**：某连接故意不收（停 read），验证 Hub 背压**只踢该设备**、其同伴设备无恙（多端模型后新增的正确断言）。
+**扩展 bench 的三个关键改造**（其中"时延直方图"已在 v2 落地，其余仍是待做项）：
+1. **流量模型贴近真实**：按 7:2:1 混入私聊:群聊:心跳，群规模 3~200 人——群消息是成本放大器（1 条 = 扇出 N 设备 + N 次未读 HINCR + N 个 Type=4 事件 + 1 次 Kafka + 1 次热层 + 冷队列入队），峰值 QPS 上限基本由群占比决定。
+2. **慢消费者专项**：某连接故意不收（停 read），验证 Hub 背压**只踢该设备**、其同伴设备无恙（多端模型后新增的正确断言）。
+3. **多机打流**：单机 2 万连接时压测客户端自身 fd/CPU 先到瓶颈。
 
 **故障与恢复场景**：① 重连风暴（杀服务端→全端重连：盯登录 Redis QPS、消费者 rebalance、时间轮任务堆积）；② 断 Kafka（消息只走内存阶段、发送不报错，恢复后补落盘）；③ 断 MySQL（冷批失败只记日志，热层/投递不受影响——降级路径的验证）；④ 优雅停机（SIGINT 后 `coldCh` 应排空、0 丢消息，看 "final flush done"）。
 
