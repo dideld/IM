@@ -15,7 +15,7 @@ storage:
   hotTTLDays: 7       # 热层 ZSet 滑动过期天数
   coldBatchSize: 100  # MySQL 冷存储批量落盘条数
   coldFlushMs: 200    # 冷存储批量落盘最长等待毫秒
-  skipBenchPersist: false  # 压测专用：clientMsgId 以 bench- 开头的消息跳过冷热存储（默认关，生产严禁常开）
+  skipBenchPersist: true  # 压测专用：clientMsgId 以 bench- 开头的消息跳过冷热存储（默认关，生产严禁常开）
 timeout:
   DelayHeartbeat: 60   #延迟心跳时间  单位秒
 auth:

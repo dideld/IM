@@ -12,7 +12,7 @@ Go 单体 Web IM（即时通讯）系统：Gin + gorilla/websocket 长连接，M
 go build .                      # 编译
 go run .                        # 本地运行，监听 0.0.0.0:8081
 docker-compose up --build       # 部署：nginx(:80，托管 /asset 并反代 WS) + go_app(:8081)
-go run test/bench_ws.go         # WS 压测（2 万连接），独立 main 程序，非单元测试
+go run test/bench_ws.go -mode echo -clients 5000 -wind 4   # WS 压测 v3（conn=长连接承载/echo=闭环自回显；前置 dev 开关 env 注入见文件头，勿在常驻配置里留着）
 ```
 
 - 本仓库没有 Go 单元测试（无 `_test.go`）。`test/` 目录下是 `package main` 的独立工具程序，用 `go run` 跑，不要用 `go test`。
@@ -26,6 +26,7 @@ go run test/bench_ws.go         # WS 压测（2 万连接），独立 main 程�
 - **宿主机直跑注意**：`host.docker.internal` 是给容器内访问宿主机用的；宿主机自己解析它依赖 Docker Desktop 运行或 `C:\Windows\System32\drivers\etc\hosts` 的条目（该条目可能被注释）。解析失效时 `go run .` 表现为 `no such host` 或 TCP 通但握手被掐——临时把三个地址改 `127.0.0.1` 测试，**提交里保持 `host.docker.internal`**（docker 部署需要）。
 - 初始化顺序有依赖（`main.go`）：InitConfig → InitMysql → models.Migrate（AutoMigrate 同步表结构）→ InitRedis → utils.InitSnowflake(`snowflake.workerId`) → models.StartColdWriter → InitKafka（生产者，内含 ensureTopic）→ StartKafkaConsumer（消费者）。时间轮 `utils.TW` 和 UDP 监听（3001 端口）由包 `init()` 自动启动，不在 main 里显式出现。
 - **优雅停机**（SIGINT/SIGTERM）：HTTP `srv.Shutdown` → `utils.CloseKafka`（停消费循环、关读写端）→ `models.StopColdWriter`（排空冷队列、落完最后一批，同步等待最长 10s）。新增需要收尾的后台组件时，按此顺序挂接。
+- **Kafka 故障排查**：容器被 SIGKILL（Docker Desktop 重启/OOM）后可能出现 LAG 为负、committed > log-end 的脏状态——消费组永远拉不到新消息，且 Async 生产者吞错（服务端看似正常，只有"落库为零"这一症状）。诊断：`kafka-consumer-groups.sh --describe`；练手恢复：删 `chat_messages` topic，启动时 ensureTopic 重建即可。
 
 ## 架构与核心链路
 
@@ -59,7 +60,7 @@ main.go → router/app.go（路由注册）→ service/*（HTTP controller，Swa
 - 多端在线（P2）：`clients map[int64][]*Node`（uid → 各设备节点），`Node.DeviceId` 来自 `/chat?deviceId=`（前端 sessionStorage 每标签页一个，双开标签页即可测多端）。register 时**同 DeviceId 替换旧节点**（页面刷新重连场景）；`send` 扇出到该用户全部设备；`dropNode` 按**指针身份**只摘自己——背压/心跳只踢单台设备，不影响其余端，也防止误删同设备重建的新连接（同 uid 多端后更不能按 uid 整删）。
 - `HubManager` 固定 16 分片，`userId % 16` 路由；每个 Hub 一个独立 goroutine 事件循环（`Run`），通过 register/unregister/send channel 通信，**无锁**——`clients` map 只允许在所属分片的 `Run` 内触碰，禁止在别的 goroutine 直接读写。
 - `Node` 持有 `CurrentHub`（所属分片）和 `DataQueue`（缓冲 1024）；队列满 `dropNode` 单端（close DataQueue 后 sendProc 关该端 TCP，客户端感知被踢）。
-- `/chat` 握手有 dev 开关 `auth.devSkipWSToken`（跳过 token 校验，**仅供 bench_ws 压测，生产严禁开启**）。
+- `/chat` 握手有 dev 开关 `auth.devSkipWSToken`（跳过 token 校验，**仅供 bench_ws 压测，生产严禁开启**；yml 不内置该项，压测时用 env `AUTH_DEVSKIPWSTOKEN=true` 注入，bench v3 启动会试探拨并在 401 时直接提示开关缺失）。
 
 ### 时间轮（`utils/timewheel.go`）
 

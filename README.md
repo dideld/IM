@@ -28,7 +28,7 @@
 ```bash
 docker-compose up -d --build    # 一键全栈，入口 http://localhost/
 go run .                        # 宿主机直跑（自备中间件），监听 0.0.0.0:8081
-go run test/bench_ws.go -clients 5000 -rate 4   # WS 压测 v2（前置开关见文件头）
+go run test/bench_ws.go -mode echo -clients 5000 -wind 4   # WS 压测 v3（echo=闭环自回显 / conn=长连接承载；前置 dev 开关用 env 注入，见文件头）
 ```
 
 浏览器访问 `http://localhost/`（compose）或 `http://localhost:8081/` 注册登录。
@@ -115,37 +115,36 @@ test/          bench_ws.go 压测     docs/  swag 生成物
 
 ## 性能与压测
 
-压测入口：`go run test/bench_ws.go -clients 20000 -rate 8`（v2）。服务端前置（压测完记得关）：`auth.devSkipWSToken: true`（跳过 WS 鉴权，dev-only）+ `storage.skipBenchPersist: true`（`bench-` 前缀消息跳过冷热存储——否则一次压测会在开发库堆上百万垃圾行）。
+压测入口（v3，阶段化）：`go run test/bench_ws.go -mode echo|conn ...`。服务端前置 dev 开关用 env 注入（勿写回提交的 yml）：`AUTH_DEVSKIPWSTOKEN=true STORAGE_SKIPBENCHPERSIST=true go run .`——bench 启动前先试探拨一条连接，401/拒连直接报缺哪个开关。`skipBenchPersist` 关库压测务必保持开，否则一次压测在开发库堆上百万垃圾行。参数：`-start` uid 号段基（真实用户同时在线时调大避串扰，如 1000000）、`-hb` 心跳间隔（默认 10s，须小于服务端 `timeout.DelayHeartbeat`）、`-timeout` 单条往返超时（超时判丢包）。
 
-**v2 已落地**（v1 数据不可信的原因，均已修复）：
+**两个模式（对齐野火 IM 阶段化思路，本轮覆盖前两项）**
 
-| 修正 | v1 的问题 |
-|---|---|
-| Type=3 心跳（与消息同一发送协程交替，规避并发写） | 无心跳 → 60s 后被时间轮全量踢线，"在线 2 万"是假数 |
-| 发送帧补 `UserId` | 缺失 → 落库生成 `p_0_{uid}` 垃圾会话 |
-| 端到端时延直方图（P50/P90/P99/Max，每 10s 摘要） | 只数包不算时延 |
-| `clientMsgId=bench-*` + skipBenchPersist 开关 | 压测流量污染 Redis/MySQL |
-| 断连即时减在线数 | successConn 只增不减 |
+| 模式 | 测什么 | 覆盖路径 |
+|---|---|---|
+| `-mode conn` | 长连接承载：拨号时延直方图、掉线归因(read/write)、单连接成本（RSS 增量/连接数；预期 35~50KB——DataQueue 1024 槽 chan + gorilla 读写缓冲 + 每连接 2 goroutine）。判据：持续 ≥2×DelayHeartbeat(120s) 在线不衰减 | 连接层：Upgrade → register → 时间轮心跳保活 |
+| `-mode echo` | 闭环自回显（`TargetId=self`）：`-wind` 为在途窗口（1=一发一收），**QPS 是测量结果而非参数乘积**；超时未回按 `-timeout` 判丢、进丢包率不进时延分位；接收帧按 clientMsgId 严格配平，匹配/dup/非业务三桶（Type=4/5 事件与欢迎帧只进 unexpected，不再灌"接收 QPS"） | 分发+通知段（内存分发全往返） |
 
-**仍未覆盖（出全量报告前须知）**：① 流量模型仍是"私聊发给自己"，测不到跨用户/群扇出成本——群消息是放大器（1 条 = N 设备扇出 + N 未读 HINCR + N 事件 + Kafka + 热层 + 冷队列），需先批量造社交图谱数据（addfriend/createCommunity/joinGroup）再按 7:2:1 混流；② 慢消费者单端被踢专项；③ 单机 2 万连接时压测客户端自身 fd/CPU 先到瓶颈，正式结论需多机打流。
+**v2.1 → v3 的教训（v2.1 的"几万"不可信）**：开环定频发送——发送 QPS ≡ clients×rate，服务端再死数字照样输出几万；丢包零记账——背压 `dropNode` 静默吃消息无处体现；时延直方图只算收到的消息（幸存者偏差，丢得越狠 P99 越好看）；关 skipBenchPersist 全链路档时 Type=4 事件帧使"接收 QPS"翻倍。v2 的修正（Type=3 心跳同协程交替写、补 UserId、断连即减在线）在 v3 全部保留，另外新增：401 试探拨、指数退避自动重连（保持 N 恒定，dropped 计数区分被踢/自杀）、在途 gauge（持续增长=服务端消化不动的饱和信号）。
+
+**容量判读 SLO**：丢包率 < 0.1% 且 RTT P99 < 100ms 的档位下，最大"完成 TPS"才算容量。预期回显会回落到 1w+ 量级——那才是诚实数字。推荐矩阵：`clients ∈ {500,2k,5k,10k} × wind ∈ {1,4,16}`，每档 `-duration 180` 取中段。Windows 单机对同一目标拨号受动态端口池（约 16k）上限，>1.5w 连接从 WSL/Linux 打流，否则失败是打流端端口耗尽。客户端自报"在线"必须对真值：`netstat` :8081 ESTABLISHED、`/debug/pprof/goroutine`、服务进程 RSS。
+
+**仍未覆盖（出全量报告前须知）**：① 落库闭环——"发送→落库→回 ack"需服务端加 Type=6 ack 帧或采样 `/user/historyMsg`；现阶段"全链路"只能 `STORAGE_SKIPBENCHPERSIST=false` 重启服务后看 Kafka LAG / MySQL 行数增速，**WS 侧数字不反映落库能力**（单分区+单消费协程+每条 4~6 次同步 Redis 往返才是分母）；② ring 跨分片分发与群聊 1→N 扇出（成本放大器：1 条 = N 设备扇出 + N 未读 HINCR + N 事件 + Kafka + 热层 + 冷队列，峰值上限基本由群占比决定；需先批量造社交图谱 addfriend/createCommunity/joinGroup 再按 7:2:1 混流）；③ 读接口（redisMsg/historyMsg/unreadList）零流量；④ 慢消费者单端被踢专项；⑤ 多机打流；⑥ 同机回环时延偏乐观，P99 不含真实网络 RTT/抖动；⑦ 真实鉴权负载（bench 用 token="test"，TouchToken 对不存在 key 的 Redis EXPIRE 属 dev 噪声）。
 
 **分层指标（SLO 建议基线）**
 
 | 层 | 指标 | 采集方式 | 基线 |
 |---|---|---|---|
-| 连接层 | 建连速率/耗时、并发连接数 | bench monitor | 2万连接 < 30s，失败率 0 |
-| 消息层 | **端到端延迟 P50/P99**（发送→接收） | bench 内置时延直方图（v2） | P99 < 200ms |
-| 消息层 | 服务端 QPS、各分片连接均衡度 | 内置 monitor + `ClientCount` 分片计数 | 分片偏差 < 2× |
-| 持久层 | 落库滞后（发送→冷层可见） | Type=4 事件的 Seq 对时 或 kafka lag | < 5s |
+| 连接层 | 建连速率/耗时、并发连接数 | `-mode conn` 拨号时延直方图 + monitor（对 netstat 真值） | 2万连接 < 30s，失败率 0，120s 内在线不衰减 |
+| 消息层 | **往返 P50/P99 + 丢包率**（闭环配对，超时判丢不进分位） | `-mode echo` 内置往返直方图 | 稳定期 P99 < 100ms，丢包 < 0.1% |
+| 消息层 | 完成 TPS、在途积压趋势 | monitor（完成/s + 在途 gauge） | 加档时 TPS 线性升、在途不持续增长 |
+| 消息层 | 各分片连接均衡度 | pprof 或加只读统计（`ClientCount` 为全量计数，分片计数需遍历 shards） | 分片偏差 < 2× |
+| 持久层 | 落库滞后（发送→冷层可见） | skip=false 档：Type=4 事件 Seq 对时 或 kafka lag | < 5s |
 | 持久层 | Kafka consumer lag | `kafka-consumer-groups.sh --describe` | 稳定期不增长 |
-| 进程层 | goroutine / GC / 内存 | `/debug/pprof/*` 压测中 30s 采样 | goroutine ≈ 连接数×2+常数 |
+| 进程层 | goroutine / GC / 内存 / 单连接成本 | `/debug/pprof/*` 压测中 30s 采样；RSS增量/clients | goroutine ≈ 连接数×2+常数；RSS/连接 ≤ 50KB |
 
-**扩展 bench 的三个关键改造**（其中"时延直方图"已在 v2 落地，其余仍是待做项）：
-1. **流量模型贴近真实**：按 7:2:1 混入私聊:群聊:心跳，群规模 3~200 人——群消息是成本放大器（1 条 = 扇出 N 设备 + N 次未读 HINCR + N 个 Type=4 事件 + 1 次 Kafka + 1 次热层 + 冷队列入队），峰值 QPS 上限基本由群占比决定。
-2. **慢消费者专项**：某连接故意不收（停 read），验证 Hub 背压**只踢该设备**、其同伴设备无恙（多端模型后新增的正确断言）。
-3. **多机打流**：单机 2 万连接时压测客户端自身 fd/CPU 先到瓶颈。
+**实战踩坑记录**：Kafka 容器被 SIGKILL（Docker Desktop 重启/内存压力）后，`chat_messages` 日志可能回退而 `__consumer_offsets` 存活——**LAG 显示负数、committed > log-end，消费组从此永远拉不到新消息**，且 Producer 是 Async 模式错误被吞（服务端只见收不到、无明显报错）。排查：`kafka-consumer-groups.sh --describe` 看 LAG 符号；恢复（练手库）：`kafka-topics.sh --delete --topic chat_messages` 让服务启动时 ensureTopic 重建即可。
 
-**故障与恢复场景**：① 重连风暴（杀服务端→全端重连：盯登录 Redis QPS、消费者 rebalance、时间轮任务堆积）；② 断 Kafka（消息只走内存阶段、发送不报错，恢复后补落盘）；③ 断 MySQL（冷批失败只记日志，热层/投递不受影响——降级路径的验证）；④ 优雅停机（SIGINT 后 `coldCh` 应排空、0 丢消息，看 "final flush done"）。
+**故障与恢复场景**：① 重连风暴（杀服务端→bench v3 全端自动指数退避重连，正好专项观察：登录 Redis QPS、消费者 rebalance、时间轮任务堆积；dropped 计数区分被踢/自杀）；② 断 Kafka（消息只走内存阶段、发送不报错，恢复后补落盘）；③ 断 MySQL（冷批失败只记日志，热层/投递不受影响——降级路径的验证）；④ 优雅停机（SIGINT 后 `coldCh` 应排空、0 丢消息，看 "final flush done"）。
 
 **容量估算**：内存 ≈ 连接数×(读写缓冲 8KB×2 + DataQueue 最坏 1024×消息均值) + 热层 Σ(会话数×hotKeep×消息大小)；注意 workerId 上限 32 实例、seq 当前为消费者单点 INCR——这两条是水平扩展前的硬边界。单机 2 万连接已近 Docker/客户端自身 fd 上限时，把 client 拆到多机压。
 
