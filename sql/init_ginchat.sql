@@ -61,6 +61,7 @@ CREATE TABLE `message` (
   `conv_key` varchar(64) DEFAULT NULL,
   `seq` bigint DEFAULT NULL,
   `client_msg_id` varchar(64) DEFAULT NULL,
+  `read_count` bigint DEFAULT 0,
   PRIMARY KEY (`id`),
   KEY `idx_message_deleted_at` (`deleted_at`),
   KEY `idx_message_conv_key` (`conv_key`),

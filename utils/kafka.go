@@ -63,39 +63,50 @@ func ensureTopic(broker, topic string) {
 	fmt.Println("Kafka topic ensured:", topic)
 }
 
-// InitKafka 初始化 Kafka 生产者
+// InitKafka 初始化 Kafka 生产者（同步模式）
+// 端到端可靠的基石：Async=false，WriteMessages 在 broker 确认后才返回，错误必须能被调用方感知
+// （曾经的 Async 吞错造成"服务端看似正常、落库为零"的事故形态）。超上限仍失败由应用层重投队列兜底。
 func InitKafka() {
 	broker := kafkaConf("broker", "host.docker.internal:9092")
 	topic := kafkaConf("topic", "chat_messages")
 	ensureTopic(broker, topic)
 	KafkaWriter = &kafka.Writer{
-		Addr:     kafka.TCP(broker),
-		Topic:    topic,
-		Balancer: &kafka.LeastBytes{},
-		// Core Advantage: Async writes!
-		Async: true,
+		Addr:         kafka.TCP(broker),
+		Topic:        topic,
+		Balancer:     &kafka.LeastBytes{},
+		Async:        false,
+		RequiredAcks: kafka.RequireAll,
+		BatchTimeout: 5 * time.Millisecond,
+		MaxAttempts:  3,
+		WriteTimeout: 5 * time.Second,
 	}
-	fmt.Println("Kafka Producer (Writer) Initialized, broker:", broker, "topic:", topic)
+	fmt.Println("Kafka Producer (sync writer) Initialized, broker:", broker, "topic:", topic)
 }
 
-// SendMsgToKafka 发送消息到 Kafka 集群
-func SendMsgToKafka(msgData []byte) {
+// Produce 同步投递一条消息到 chat_messages。
+// 返回非 nil 即"broker 未收下"，调用方必须走重投/失败回执，绝不静默丢弃。
+func Produce(msgData []byte) error {
 	if KafkaWriter == nil {
-		fmt.Println("Kafka is not initialized!")
-		return
+		return fmt.Errorf("kafka writer not initialized")
 	}
-	err := KafkaWriter.WriteMessages(context.Background(),
+	return KafkaWriter.WriteMessages(context.Background(),
 		kafka.Message{
 			Value: msgData,
 		},
 	)
-	if err != nil {
+}
+
+// SendMsgToKafka 兼容旧调用点的薄封装（忽略错误=仅限"无需回执"的旁路流量使用）
+func SendMsgToKafka(msgData []byte) {
+	if err := Produce(msgData); err != nil {
 		fmt.Println("【严重警告】Kafka 投递失败:", err)
 	}
 }
 
-// StartKafkaConsumer 启动消费者负责排队落盘 Redis
-func StartKafkaConsumer(consumeHandler func([]byte)) {
+// StartKafkaConsumer 启动消费者负责排队落盘 Redis。
+// 手动提交（at-least-once）：handler 返回 nil 才 commit offset；返回 error 不提交、退避后由 Kafka 重投。
+// handler 内部负责自身的有界重试/死信/失败 ACK，避免毒消息无限占住分区。
+func StartKafkaConsumer(consumeHandler func([]byte) error) {
 	kafkaQuit = make(chan struct{})
 	kafkaOnce = sync.Once{}
 	kafkaReader = kafka.NewReader(kafka.ReaderConfig{
@@ -110,6 +121,7 @@ func StartKafkaConsumer(consumeHandler func([]byte)) {
 	fmt.Println("Kafka Consumer (Reader) Started and Listening...")
 
 	go func() {
+		ctx := context.Background()
 		for {
 			select {
 			case <-kafkaQuit:
@@ -117,9 +129,9 @@ func StartKafkaConsumer(consumeHandler func([]byte)) {
 				return
 			default:
 			}
-			m, err := kafkaReader.ReadMessage(context.Background())
+			m, err := kafkaReader.FetchMessage(ctx)
 			if err != nil {
-				log.Println("Kafka Read Error (Retrying...):", err)
+				log.Println("Kafka Fetch Error (Retrying...):", err)
 				select {
 				case <-kafkaQuit:
 					return
@@ -128,8 +140,20 @@ func StartKafkaConsumer(consumeHandler func([]byte)) {
 				time.Sleep(3 * time.Second) // 避雷：没开 kafka 时防死循环暴搜
 				continue
 			}
-			// 将读到的消息扔给冷热持久化方法
-			consumeHandler(m.Value)
+			// 落库+分发+ACK 全部完成（handler 返回 nil）才提交 offset；
+			// 返回 error 不提交，退避后 Kafka 重投（at-least-once，幂等由 handler 内部保证）
+			if err := consumeHandler(m.Value); err != nil {
+				log.Println("consume handler failed, offset 不提交, 1s 后重投:", err)
+				select {
+				case <-time.After(time.Second):
+				case <-kafkaQuit:
+					return
+				}
+				continue
+			}
+			if err := kafkaReader.CommitMessages(ctx, m); err != nil {
+				log.Println("Kafka commit error(下轮重投由幂等兜底):", err)
+			}
 		}
 	}()
 }

@@ -12,7 +12,7 @@ Go 单体 Web IM（即时通讯）系统：Gin + gorilla/websocket 长连接，M
 go build .                      # 编译
 go run .                        # 本地运行，监听 0.0.0.0:8081
 docker-compose up --build       # 部署：nginx(:80，托管 /asset 并反代 WS) + go_app(:8081)
-go run test/bench_ws.go -mode echo -clients 5000 -wind 4   # WS 压测 v3（conn=长连接承载/echo=闭环自回显；前置 dev 开关 env 注入见文件头，勿在常驻配置里留着）
+go run test/bench_ws.go -mode echo -clients 5000 -wind 4   # WS 压测 v3（conn=长连接承载/echo=闭环自回显/ack=落库全链路，需 skipBenchPersist=false；前置 dev 开关 env 注入见文件头，勿在常驻配置里留着）
 ```
 
 - 本仓库没有 Go 单元测试（无 `_test.go`）。`test/` 目录下是 `package main` 的独立工具程序，用 `go run` 跑，不要用 `go test`。
@@ -24,9 +24,9 @@ go run test/bench_ws.go -mode echo -clients 5000 -wind 4   # WS 压测 v3（conn
 - **一键全栈**：`docker-compose up -d --build` 起 MySQL+Redis+Kafka+go_app+Nginx（compose 里 go_app 用 env 指向容器服务名；中间件端口只绑 127.0.0.1，MySQL 对外 13306 避开宿主机原生实例；Kafka 双监听器 INTERNAL `kafka:9092` / HOST `localhost:9092`）。依赖镜像拉取需宿主机代理在线（Docker 配了 127.0.0.1:7890）。
 - 上传目录走 `upload.path`（缺省 `./asset/upload`，不存在自动创建），单文件上限 `upload.maxSizeMB`（缺省 10MB，`MaxBytesReader` 硬限）；扩展名白名单在 `service/attach.go`（图片+音频，白名单外拒绝——该目录被 Nginx 直接托管）。`asset/upload/` 与 `cache/` 已 gitignore，用户产物不得再提交。
 - **宿主机直跑注意**：`host.docker.internal` 是给容器内访问宿主机用的；宿主机自己解析它依赖 Docker Desktop 运行或 `C:\Windows\System32\drivers\etc\hosts` 的条目（该条目可能被注释）。解析失效时 `go run .` 表现为 `no such host` 或 TCP 通但握手被掐——临时把三个地址改 `127.0.0.1` 测试，**提交里保持 `host.docker.internal`**（docker 部署需要）。
-- 初始化顺序有依赖（`main.go`）：InitConfig → InitMysql → models.Migrate（AutoMigrate 同步表结构）→ InitRedis → utils.InitSnowflake(`snowflake.workerId`) → models.StartColdWriter → InitKafka（生产者，内含 ensureTopic）→ StartKafkaConsumer（消费者）。时间轮 `utils.TW` 和 UDP 监听（3001 端口）由包 `init()` 自动启动，不在 main 里显式出现。
-- **优雅停机**（SIGINT/SIGTERM）：HTTP `srv.Shutdown` → `utils.CloseKafka`（停消费循环、关读写端）→ `models.StopColdWriter`（排空冷队列、落完最后一批，同步等待最长 10s）。新增需要收尾的后台组件时，按此顺序挂接。
-- **Kafka 故障排查**：容器被 SIGKILL（Docker Desktop 重启/OOM）后可能出现 LAG 为负、committed > log-end 的脏状态——消费组永远拉不到新消息，且 Async 生产者吞错（服务端看似正常，只有"落库为零"这一症状）。诊断：`kafka-consumer-groups.sh --describe`；练手恢复：删 `chat_messages` topic，启动时 ensureTopic 重建即可。
+- 初始化顺序有依赖（`main.go`）：InitConfig → InitMysql → models.Migrate（AutoMigrate 同步表结构）→ InitRedis → utils.InitSnowflake(`snowflake.workerId`) → StartColdWriter（落盘成功后负责投递+ACK 的冷 writer，**必须在 DB 就绪后、消费者启动前**）→ InitKafka（同步生产者，内含 ensureTopic）→ StartKafkaConsumer（手动提交消费，回调 persistMessage）。时间轮 `utils.TW` 和 UDP 监听（3001 端口）由包 `init()` 自动启动，不在 main 里显式出现。
+- **优雅停机**（SIGINT/SIGTERM）：HTTP `srv.Shutdown` → `utils.CloseKafka`（停消费循环、关读写端）→ `models.StopColdWriter`（排空冷队列、落完最后一批**并完成其投递+ACK 收尾**，同步等待最长 10s）。新增需要收尾的后台组件时，按此顺序挂接。
+- **Kafka 故障排查**：容器被 SIGKILL（Docker Desktop 重启/OOM）后可能出现 LAG 为负、committed > log-end 的脏状态——消费组永远拉不到新消息（旧 Async 生产者还吞错；现生产者已改同步、错误即时可见，但**先落盘后投递意味着消费停滞=新消息既不到货也不回 ACK**）。诊断：`kafka-consumer-groups.sh --describe`；练手恢复：删 `chat_messages` topic，启动时 ensureTopic 重建即可。**另一个新坑：LAG 大量积压时新消息的投递/ACK 会被淹没**（历史压测残留 410 万条曾把 ack 冒烟全顶成超时）——压测或排障前先确认 LAG 近零；残留 bench 数据可临时开 `STORAGE_SKIPBENCHPERSIST=true` 空跑消化或删 topic。
 
 ## 架构与核心链路
 
@@ -40,11 +40,12 @@ main.go → router/app.go（路由注册）→ service/*（HTTP controller，Swa
 ### 消息主链路（核心，跨 message.go / hub.go / kafka.go / timewheel.go）
 
 1. 客户端连 `/chat?userId=x&token=y`（唯一 WS 入口；token 为登录签发的 Redis 会话，见"鉴权会话"）→ 创建 `Node`，注册进分片 Hub，起 `sendProc` / `recvProc` 两个 goroutine。
-2. `recvProc` 收到帧后解析 JSON：`Type==3` 是心跳（业务层 JSON 消息，不是 WS ping 帧），只 `TouchToken` 续会话 + 刷新时间轮任务并 `continue`；其余交给 `dispatch`（Type 1=私聊，2=群聊，群聊查 contact 表拿成员逐个下发）。
-3. `sendMsg` 两阶段投递：
-   - **阶段一（内存，低延迟）**：`WsHub.GetHub(目标)` → `send` channel → 目标 `DataQueue` → `sendProc` 写 WS。
-   - **阶段二（异步，可靠性）**：投 Kafka topic `chat_messages`（Async 生产者）→ 消费者组消费 → `models.persistMessage` 冷热双层落存储（见"消息冷热存储"）。系统提示语（如欢迎语）走 `deliverLocal`（仅内存分发，**不进 Kafka/持久化**，历史上曾以纯文本污染 `msg_0_0` key）。
-   - 两阶段顺序不可调换、不可省略阶段二：注释标明设计意图是"先瞬间送达，再异步落盘，进程崩溃不丢消息"。
+2. `recvProc` 收到帧后解析 JSON：`Type==3` 是心跳（业务层 JSON 消息，不是 WS ping 帧），只 `TouchToken` 续会话 + 刷新时间轮任务并 `continue`；其余先过 `validateMsg` 结构校验（缺 clientMsgId、TargetId 非法、消息体空 → **即时回 Type=6 Status=-1 ACK，不入库不重投**——"参数非法"与"存储故障"语义分开），通过后交 `dispatchTo` 入队。WS 侧**不再有任何直接投递**（Type 1/2 同路径）。
+3. **存储转发管线（先落盘、后投递——端到端可靠，取代旧"内存先行/异步落盘"两阶段）**：
+   - **入队**：`produceOrDefer` 同步投 Kafka `chat_messages`（`Async=false`+`RequireAll`，broker 确认才返回）。失败进应用层重投队列（2s/轮 × 5 轮，超限才回 -1 ACK；耗尽前"不 ACK"属正常，由客户端 pending 重发兜底）。
+   - **消费**：`FetchMessage` → `models.persistMessage`：幂等门禁（`cm:{convId}` HASH，HSetNX "P"→"seq:msgId"；**重放命中不重复落库、回补原 Seq/MsgId 的 ACK**）→ 发 seq → 热层 Pipeline → 冷写（`storage.coldMode`：batch=攒批 flush 成功后放行 / inline=单条立即写——**两档都必须冷层写入成功才允许投递**）→ handler 返回 nil 才提交 offset（at-least-once）。
+   - **放大分发**（`deliverLanded`，models/deliver.go）：私聊投目标（给自己发不积未读）；群聊按 `g_members` 缓存逐成员扇出（排除发送者）；随后 `pushUnread`（未读 + Type=4，`push.enabled` 时对无在线设备者走 OfflinePush 挂点）；最后回发送者 **Type=6 ACK（Status 0，带 Seq/MsgId）**。
+   - **新不变量：冷层写成功前不得投递；分发+ACK 完成前不得提交 offset**。失败收口在 persistMessage 内有界完成（清去重标记 + `msg:dlq` 死信留证 + 错误 ACK-1，然后照常提交，毒消息不占分区）。系统提示语（欢迎语）仍走 `deliverLocal`（仅内存、不落库不回 ACK）。代价：消息可见时延 +Kafka 往返+攒批（`coldFlushMs` 缺省 50ms）；收益：Kafka/MySQL 故障不再"假送达"，崩溃恢复靠 offset 重放。
 
 ### 鉴权会话（`utils/auth.go`，P0 新增）
 
@@ -60,6 +61,7 @@ main.go → router/app.go（路由注册）→ service/*（HTTP controller，Swa
 - 多端在线（P2）：`clients map[int64][]*Node`（uid → 各设备节点），`Node.DeviceId` 来自 `/chat?deviceId=`（前端 sessionStorage 每标签页一个，双开标签页即可测多端）。register 时**同 DeviceId 替换旧节点**（页面刷新重连场景）；`send` 扇出到该用户全部设备；`dropNode` 按**指针身份**只摘自己——背压/心跳只踢单台设备，不影响其余端，也防止误删同设备重建的新连接（同 uid 多端后更不能按 uid 整删）。
 - `HubManager` 固定 16 分片，`userId % 16` 路由；每个 Hub 一个独立 goroutine 事件循环（`Run`），通过 register/unregister/send channel 通信，**无锁**——`clients` map 只允许在所属分片的 `Run` 内触碰，禁止在别的 goroutine 直接读写。
 - `Node` 持有 `CurrentHub`（所属分片）和 `DataQueue`（缓冲 1024）；队列满 `dropNode` 单端（close DataQueue 后 sendProc 关该端 TCP，客户端感知被踢）。
+- Hub 另有 `probe` 只读通道（`HasOnline(uid)`）：跨 goroutine 查 `clients` 的唯一合法途径，供离线推送判定；探测超时按"在线"处理防推送风暴。
 - `/chat` 握手有 dev 开关 `auth.devSkipWSToken`（跳过 token 校验，**仅供 bench_ws 压测，生产严禁开启**；yml 不内置该项，压测时用 env `AUTH_DEVSKIPWSTOKEN=true` 注入，bench v3 启动会试探拨并在 401 时直接提示开关缺失）。
 
 ### 时间轮（`utils/timewheel.go`）
@@ -73,8 +75,10 @@ main.go → router/app.go（路由注册）→ service/*（HTTP controller，Swa
 - `user_info:{id}`：用户缓存。读路径为 Cache-Aside + `"null"` 占位 60s 防穿透 + `singleflight` 防击穿（见 `FindUserById`）；写路径为延时双删——先删缓存 → 改库 → 时间轮挂 500ms 后第二删 + 异步重建（见 `UpdateUser`）。改用户缓存逻辑须保持这套组合完整。
 - **会话 id（convId，P1 引入）**：私聊 `p_{小id}_{大id}`、群聊 `g_{群id}`，唯一来源 `models/store.go` 的 `convIdOf`——**`views/chat/foot.html` 有它的 JS 镜像实现 `convIdOf`，改 Go 侧必须同步改前端**。热层 ZSet key、冷层 `conv_key` 列、未读 field、Type=4 事件全用它；`msg_` 前缀旧体系已一刀切废弃。
 - `seq:{convId}`：会话级递增序号发号器（`INCR`，消费者是唯一写入点）。**热层 ZSet 的 score = seq**（不再是雪花；53-bit 精度约束现在只剩 msgId 需要）。ZSet 修剪至 `storage.hotKeep` + 滑动 TTL 逻辑不变。
-- **消息冷热存储（`models/store.go`）**：消费者回调 `persistMessage`：clientMsgId 去重（`cm:{convId}` SET 近窗判重，超 2×hotKeep 随机淘汰，远期靠主键冲突兜底）→ 发 seq → 热层 Pipeline → 投 `coldCh` 由 `StartColdWriter` 批量 `CreateInBatches`（主键 id=雪花 msgId，`(conv_key, seq)` 复合唯一索引 `uk_conv_seq`；OnConflict DoNothing + 冲突跳过计数【警告】；停机由 `StopColdWriter` 同步排空）。
-- **未读、已读与回执**：HASH `unread:{uid}`（field=convId）由 `pushUnread` 累加（私聊给接收方；群聊给除发送者外全体成员），向在线端推 `Type=4` 事件 `{"Type":4,"ConvId","Seq","Unread"}`。`MarkRead`：清未读 + Redis 游标 + **`user_read_cursor` 表 upsert 落库**（markRead 频率低，同步写可接受，上量再改批量 channel）；**私聊**回填对端消息 `read_time` 并向对方在线设备推 `Type=5` 回执 `{"Type":5,"ConvId","ReadSeq","Reader"}`；群聊只记成员水位（逐条全员回执留后续）。前端 `readStatus` 接口 + `convReadSeq` 驱动气泡"已读"。事件帧 **仅服务端→客户端**，前端 `onmessage` 必须在 `loaduserinfo` 之前拦截 Type=4/5（否则无效 HTTP + 污染 msglist）。
+- **消息冷热存储（`models/store.go` + `models/deliver.go`）**：消费者回调 `persistMessage`（先落盘后投递）：clientMsgId 幂等门禁（**`cm:{convId}` HASH**，field=clientMsgId，value `"P"→"seq:msgId"`；HSetNX 命中终值=重放，回补原 ACK 不重复落库；超 2×hotKeep 用 HRandField 随机淘汰，远期靠唯一索引兜底；**失败路径 HDEL 标记允许重新落库**）→ 发 seq → 热层 Pipeline → 冷写（`storage.coldMode=batch|inline`，两档都**必须冷层写成功**；batch 由 `StartColdWriter` 攒批 `CreateInBatches`，flush 成功→`deliverLanded` 放大分发→回 done；失败重试耗尽→清标记 + `msg:dlq` 死信 LIST(封顶500) + 错误 ACK-1）→ 消费端才 commit offset。`StopColdWriter` 排空=落完+投完+ACK 完。
+- **群成员缓存 `g_members:{gid}`（SET，TTL 24h）**：群消息落盘后逐成员扇出每条必查，必须走缓存；`JoinGroup` 即时 SAdd，退群/解散靠 TTL 最终一致（新增群成员变更点时记得同步）。
+- **未读、已读与回执**：HASH `unread:{uid}`（field=convId）由 `pushUnread` 累加（**调用点在 deliverLanded，即落盘之后**；私聊给接收方；群聊给除发送者外全体成员），向在线端推 `Type=4` 事件 `{"Type":4,"ConvId","Seq","Unread"}`；`push.enabled` 时对无在线设备者（Hub `HasOnline` probe 探测，超时按在线防误报）调 `utils.OfflinePush` 挂点（厂商实现未接，离线补偿仍靠"未读+拉取"）。`MarkRead`：清未读 + Redis 游标 + `user_read_cursor` 表 upsert 落库（**取旧游标必须在覆盖游标前**，群逐条计数要用窗口）；**私聊**回填对端消息 `read_time` 并向对方在线设备推 `Type=5` 回执 `{"Type":5,"ConvId","ReadSeq","Reader"}`；**群聊逐条回执已落地**：已读窗口 `(old, ReadSeq]` 内他人消息 `message.read_count + 1`（水位单调天然防重计，服务端权威计数、冷翻页直接带出），并向除已读者外全体在线成员广播 Type=5（前端按 Reader 去重聚成"N 人已读"徽章，只对有 seq 的气泡计数——seq 由 Type=6 ACK 回填）。事件帧 **仅服务端→客户端**（4/5/6），前端 `onmessage` 必须在 `loaduserinfo` 之前拦截（否则无效 HTTP + 污染 msglist）。
+- **Type=6 发送确认（ACK）**：`{"Type":6,"ClientMsgId","ConvId","Seq","MsgId","Status"}`（Go 侧 Pascal 键），Status 0=落库+分发完成，-1=服务端拒绝（带 Reason，**参数非法即时回、存储故障重投耗尽才回**）。clientMsgId 是幂等键也是 ACK 关联键——业务消息缺失即按非法拒绝。前端气泡状态机：sending→(ACK)→sent/ 超时同 id 重发 ≤3 次 / fail 点击重发 / 断线 onopen 全量补发；接收端按 clientMsgId 去渲染重（at-least-once 投递）。
 - 读接口四条（全部经 X-Token 会话鉴权 + `ConvHasMember` 成员校验）：`/user/redisMsg` 热层（`convId` 参数，兼容 userIdA/B 推导；**响应列表在 `Total` 字段的前端契约勿改**）；`/user/historyMsg` 冷层（`convId + beforeSeq + size`，Rows 含 Seq，末行 seq 翻下页）；`/user/markRead`、`/user/unreadList`、`/user/readStatus`（身份取会话，表单 userId 被忽略）。
 
 ### 雪花 ID（`utils/snowflake.go`）
@@ -88,7 +92,7 @@ main.go → router/app.go（路由注册）→ service/*（HTTP controller，Swa
 - 所有表用 `gorm.Model`（软删除 `deleted_at`），启动时 `models.Migrate()` AutoMigrate 同步结构，建表脚本 `sql/init_ginchat.sql` 是快照（其中 message 段含 DROP 重建，见下）。
 - `message` 表为冷存储全量归档：主键 id 显式写入雪花 ID（非自增），另有 `seq`（会话内递增号）与 `conv_key`，`(conv_key, seq)` 复合唯一。旧 DDL（form_id/target_id longtext）与新结构不兼容，开发库需先 `DROP TABLE message;` 一次。
 - `Contact.Type`：1=好友（**双向各存一行**，增删须成对处理，见 `AddFriend`/`DeleteFriend`），2=群成员关系（owner_id=用户，target_id=群）。
-- `Message.Type`：1 私聊 / 2 群聊 / 3 心跳 / 4 未读事件 / 5 已读回执（**4、5 仅服务端→客户端**，客户端若回发会走 dispatch 无匹配分支被无害忽略）；`Media`：文字、表情、图片、音频；`Amount`（原拼写错误字段 `Amoubt` 已改名，改后前端 `amount` JSON 才真正绑定得上）；`ClientMsgId`：客户端幂等键（`genMsgId()` 生成）。
+- `Message.Type`：1 私聊 / 2 群聊 / 3 心跳 / 4 未读事件 / 5 已读回执 / 6 发送确认(ACK)（**4、5、6 仅服务端→客户端**，客户端若回发会因 dispatchTo 无匹配分支被无害忽略；4/5/6 事件无 clientMsgId 关联，前端务必先拦截）；`Media`：文字、表情、图片、音频；`Amount`（原拼写错误字段 `Amoubt` 已改名，改后前端 `amount` JSON 才真正绑定得上）；`ReadCount`：群聊逐条已读计数（MarkRead 窗口逐条 +1，见"未读、已读与回执"）；`ClientMsgId`：客户端幂等键兼 ACK 关联键（`genMsgId()` 生成，业务消息缺失即被结构校验拒绝）。
 - `user_read_cursor` 表：`(user_id, conv_key)` 唯一，`last_seq` 为已读水位——Redis `read:` 游标的持久账本。
 
 ### 已清理的遗留路径

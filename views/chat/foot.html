@@ -41,6 +41,9 @@
                 communitys: [],
                 unread: {},   //会话未读数 {convId: count}，来源 /user/unreadList + Type=4 事件
                 convReadSeq: {},   //私聊对端已读游标 {convId: readSeq}，来源 /user/readStatus + Type=5 回执
+                pending: {},   //发送确认(ACK)状态机：clientMsgId → {msg, bubble, tries, timer}；断线重连 onopen 时整体重发
+                seenIds: {},   //接收端幂等：同 clientMsgId 的投递副本只渲染一次（落盘后置分发是 at-least-once）
+                seenCount: 0,
                 deviceId: (function () {
                     // sessionStorage 使每个浏览器标签页独立成"一台设备"，双开标签页即可联调多端在线
                     var d = sessionStorage.getItem("deviceId");
@@ -278,7 +281,7 @@
                 showweixin: function () {
                     mui.alert("请加微信号msb-shenzhuan索取")
                 },
-                showmsg: function (user, msg, isReverse, isFirst) {
+                showmsg: function (user, msg, isReverse, isFirst, livePending) {
                     //console.log(">>>>>>>>>>>", user)
                     // console.log(">>>>>>>>>>>", msg)
                     var data = {
@@ -287,6 +290,10 @@
                     //渲染时已知对端游标则直接标记"已读"（历史回灌与实时同一路径）
                     if (data.ismine && (this.convReadSeq[this.currentConvId()] || 0) > 0) {
                         data.read = true
+                    }
+                    if (livePending) {
+                        data.mstat = 'sending'  //本地新发送气泡：等待 Type=6 ACK 定状态
+                        data.seq = 0            //seq 由 ACK 回填，群"N人已读"只对有 seq 的气泡计数
                     }
                     //console.log(data.ismine,userId(),msg.userid)
                     data.user = user;
@@ -321,6 +328,80 @@
 
                         clearTimeout(that.timer)
                     }, 100)
+                    return data
+                },
+                // ===== 发送确认(ACK)状态机：dispatchSend/_trySend/ackMsg/retryMsg/flushPending =====
+                dispatchSend: function (msg) {
+                    if (!msg.clientMsgId) msg.clientMsgId = this.genMsgId();
+                    // 私聊本地先挂气泡并置 pending；群聊维持原 UX(自己不弹泡，其他成员经落盘分发收到)
+                    var bubble = (msg.Type == 1) ? this.showmsg(userInfo(), msg, false, false, true) : null;
+                    this.pending[msg.clientMsgId] = { msg: msg, bubble: bubble, tries: 0, timer: null };
+                    this._trySend(msg.clientMsgId);
+                },
+                _trySend: function (id) {
+                    var that = this;
+                    var p = this.pending[id];
+                    if (!p) return;
+                    if (this.webSocket && this.webSocket.readyState === 1) {
+                        this.webSocket.send(JSON.stringify(p.msg));
+                        if (p.bubble) Vue.set(p.bubble, 'mstat', 'sending');
+                        p.tries++;
+                    } else {
+                        if (p.bubble) Vue.set(p.bubble, 'mstat', 'wait'); // 断线：onopen 统一补发
+                    }
+                    clearTimeout(p.timer);
+                    p.timer = setTimeout(function () {
+                        var q = that.pending[id];
+                        if (!q) return;
+                        if (q.tries <= 3) {
+                            that._trySend(id); // 超时重发同 clientMsgId：服务端幂等命中会回补原 ACK(带 Seq/MsgId)
+                        } else {
+                            delete that.pending[id];
+                            if (q.bubble) Vue.set(q.bubble, 'mstat', 'fail');
+                        }
+                    }, 10000);
+                },
+                ackMsg: function (data) {
+                    var p = this.pending[data.ClientMsgId];
+                    if (!p) return; // 迟到/重放补发的 ACK：无 pending 即无需对账
+                    clearTimeout(p.timer);
+                    delete this.pending[data.ClientMsgId];
+                    if (!p.bubble) return;
+                    if (data.Status === 0) {
+                        Vue.set(p.bubble, 'mstat', 'sent');
+                        if (data.Seq) Vue.set(p.bubble, 'seq', data.Seq); // seq 回填：群"N人已读"徽章的对账依据
+                        if (data.MsgId) p.mid = data.MsgId;
+                    } else {
+                        Vue.set(p.bubble, 'mstat', 'fail');
+                        if (data.Reason) mui.toast('发送失败：' + data.Reason);
+                    }
+                },
+                retryMsg: function (item) { // 失败气泡点击重发：复用同一 clientMsgId，绝不产生第二条落库
+                    var id = item.msg.clientMsgId;
+                    if (!id) return;
+                    if (this.pending[id]) { this._trySend(id); return; }
+                    this.pending[id] = { msg: item.msg, bubble: item, tries: 0, timer: null };
+                    this._trySend(id);
+                },
+                flushPending: function () { // 重连成功：pending 全量补发（先清零 tries，给新一轮 3 次机会）
+                    for (var id in this.pending) {
+                        var p = this.pending[id];
+                        p.tries = 0;
+                        this._trySend(id);
+                    }
+                },
+                readerCount: function (item) {
+                    return item.greaders ? Object.keys(item.greaders).length : 0;
+                },
+                markGroupReaders: function (data) { // 群逐条已读：我有 seq 的气泡(seq<=ReadSeq)按 Reader 去重累计"N 人已读"
+                    var gid = data.ConvId.slice(2), that = this;
+                    this.msglist.forEach(function (b) {
+                        if (b.ismine && b.seq > 0 && b.msg.Type == 2 && '' + b.msg.TargetId === '' + gid && b.seq <= data.ReadSeq) {
+                            var r = b.greaders || {};
+                            r[data.Reader] = 1;
+                            Vue.set(b, 'greaders', r);
+                        }
+                    });
                 },
                 startrecord: function () {
 
@@ -334,11 +415,7 @@
                         msg.Media = 1;
                         msg.Content = txt;
                         msg.clientMsgId = this.genMsgId();
-                        if (msg.Type == 1) {
-                            this.showmsg(userInfo(), msg);
-                        }
-
-                        this.webSocket.send(JSON.stringify(msg))
+                        this.dispatchSend(msg)
                     }
                 },
                 sendpicmsg: function (picurl) {
@@ -349,10 +426,7 @@
                         msg.Media = 4;
                         msg.url = picurl;
                         msg.clientMsgId = this.genMsgId();
-                        if (msg.Type == 1) {
-                            this.showmsg(userInfo(), msg);
-                        }
-                        this.webSocket.send(JSON.stringify(msg))
+                        this.dispatchSend(msg)
                     }
                 },
                 sendaudiomsg: function (url, num) {
@@ -364,11 +438,7 @@
                         msg.url = url;
                         msg.amount = num;
                         msg.clientMsgId = this.genMsgId();
-                        if (msg.Type == 1) {
-                            this.showmsg(userInfo(), msg);
-                        }
-                        //console.log("sendaudiomsg",this.msglist);
-                        this.webSocket.send(JSON.stringify(msg))
+                        this.dispatchSend(msg)
                     }
                 },
                 scrollConcat() {
@@ -532,11 +602,20 @@
                     }
                 },
                 onmessage: function (data) {
+                    if (data.Type === 6) {
+                        //服务端发送确认(仅服务端→客户端)：按 clientMsgId 定气泡状态，绝不进 msglist
+                        this.ackMsg(data)
+                        return
+                    }
                     if (data.Type === 5) {
-                        //私聊已读回执：记录游标；命中当前会话则把我此前发的气泡标"已读"
+                        //已读回执：私聊记游标标"已读"；群聊(逐条)按 Reader 给我有 seq 的气泡累计"N 人已读"
                         this.convReadSeq[data.ConvId] = data.ReadSeq
                         if (data.ConvId === this.currentConvId()) {
-                            this.markMineAsRead()
+                            if (data.ConvId.indexOf('g_') === 0) {
+                                this.markGroupReaders(data)
+                            } else {
+                                this.markMineAsRead()
+                            }
                         }
                         return
                     }
@@ -548,6 +627,12 @@
                             Vue.set(this.unread, data.ConvId, data.Unread)
                         }
                         return
+                    }
+                    //业务消息接收端幂等：落盘后置分发是 at-least-once，同 clientMsgId 只渲染一次
+                    if (data.clientMsgId) {
+                        if (this.seenIds[data.clientMsgId]) return
+                        this.seenIds[data.clientMsgId] = 1
+                        if (++this.seenCount > 500) { this.seenIds = {}; this.seenCount = 0 } //简单封顶清理
                     }
                     this.loaduserinfo(data.userId, function (user) {
 
@@ -583,9 +668,10 @@
                             console.log("recv<==" + evt.data)
                         }
                     }.bind(this)
-                    //打开成功：补偿断线/离线期间的未读变化
+                    //打开成功：补偿断线/离线期间的未读变化 + pending 未确认消息全量重发
                     this.webSocket.onopen = function (evt) {
                         this.loadUnread()
+                        this.flushPending()
                     }.bind(this)
                     //关闭回调
                     this.webSocket.onclose = function (evt) {

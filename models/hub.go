@@ -1,6 +1,7 @@
 package models
 
 import (
+	"time"
 	//"fmt"
 	//"time"
 	//"github.com/spf13/viper"
@@ -13,12 +14,20 @@ type Hub struct {
 	register   chan *Node
 	unregister chan *Node
 	send       chan *SendRequest
+	probe      chan *onlineProbe // 只读在线探测：跨 goroutine 查 clients 的唯一合法通道（Run 内应答）
 }
 const HubShardCount = 16 //分片数量
 
 type SendRequest struct {
 	userID int64
 	data   []byte
+}
+
+// onlineProbe 离线推送挂点用：判断"该 uid 是否有任何在线设备"。
+// clients map 只允许在所属分片 Run 内触碰（见 CLAUDE.md），因此探测必须走 channel 请求-应答。
+type onlineProbe struct {
+	uid   int64
+	reply chan bool
 }
 type HubManager struct {
     shards []*Hub
@@ -29,6 +38,7 @@ func NewHub() *Hub {
 		register:   make(chan *Node),
 		unregister: make(chan *Node),
 		send:       make(chan *SendRequest, 1024),
+		probe:      make(chan *onlineProbe),
 	}
 }
 func (h *Hub) Run() {
@@ -61,6 +71,10 @@ func (h *Hub) Run() {
 					h.dropNode(node)
 				}
 			}
+
+		case p := <-h.probe:
+			// Run 内天然单线程，读 clients 合法（离线推送挂点专用）
+			p.reply <- len(h.clients[p.uid]) > 0
 		}
 	}
 }
@@ -80,6 +94,25 @@ func (m *HubManager) GetHub(userId int64) *Hub {
     // 简单的求模算法
     index := userId % int64(HubShardCount)
     return m.shards[index]
+}
+
+// HasOnline 经 probe 通道询问分片"该用户是否有任一在线设备"（clients 只能在 Run 内触碰）。
+// 探测超时按"在线"处理——宁可漏一次推送通知，也不在 Hub 繁忙时把在线用户误判离线引发推送风暴。
+func (m *HubManager) HasOnline(userId int64) bool {
+	hub := m.GetHub(userId)
+	reply := make(chan bool, 1)
+	probe := &onlineProbe{uid: userId, reply: reply}
+	select {
+	case hub.probe <- probe:
+	case <-time.After(100 * time.Millisecond):
+		return true
+	}
+	select {
+	case ok := <-reply:
+		return ok
+	case <-time.After(200 * time.Millisecond):
+		return true
+	}
 }
 
 var WsHub = NewHubManager()
@@ -114,3 +147,4 @@ func (h *Hub) dropNode(node *Node) {
 		}
 	}
 }
+

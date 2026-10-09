@@ -262,8 +262,8 @@ func HistoryMsg(c *gin.Context){
 
 // MarkRead
 // @Tags 消息模块
-// @Summary 打开会话即已读（清未读并记录seq游标）
-// @param userId formData string true "用户id"
+// @Summary 打开会话即已读（清未读并记录seq游标；群聊同时按已读窗口逐条 read_count+1 并向成员广播 Type=5）
+// @param userId formData string true "用户id(被忽略，身份取会话)"
 // @param convId formData string true "会话id"
 // @Produce json
 // @Success 200 {string} json{"code"，"message"}

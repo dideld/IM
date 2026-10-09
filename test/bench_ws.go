@@ -2,21 +2,33 @@
 //
 // 服务端前置（勿把 dev 开关写回提交的 yml，用 env 注入，见 CLAUDE.md）：
 //
-//	AUTH_DEVSKIPWSTOKEN=true STORAGE_SKIPBENCHPERSIST=true go run .
+//	AUTH_DEVSKIPWSTOKEN=true go run .
+//	# echo/ack 档还要求 STORAGE_SKIPBENCHPERSIST=false（缺省即 false）——
+//	# 管线已改为"先落盘再投递"，旁路档不落库→不分发→不回 ACK，只有 conn 档能跑。
+//	# ack/echo 档数据会落开发库：跑完按 client_msg_id LIKE 'bench-%' 清 message 表；
+//	# 跑前确认 Kafka LAG 近零，历史积压会把新消息的投递/ACK 淹没成"全丢包"假象。
 //
 // bench 启动时先试探拨一条连接，401/拒连直接报错提示缺哪个开关（仓库 yml 目前不含
 // auth.devSkipWSToken，必须 env 注入，否则所有连接握手全量失败）。
 //
-// 两个模式（对齐野火 IM 阶段化压测思路，本轮覆盖前两项）：
-//   -mode echo ：闭环自回显（TargetId=自己，发送→服务端内存分发→收 own 消息=分发+通知段）。
+// 三种模式（对齐野火 IM 阶段化压测思路：conn=连接承载、echo=分发+通知段、ack=发送落库回执全链路）：
+//   -mode echo ：闭环回显（TargetId=自己；配平点是**落盘后分发的 own 消息帧**=接收方视角全往返）。
 //     -wind 为在途窗口(1=一发一收)，QPS 是"测量结果"而非"参数乘积"——v2.1 开环下
 //     发送数恒等于 clients×rate，服务端再慢数字也照样上万，此坑已修。
 //     超时未回按 -timeout 判丢并计入丢包率、不进时延分位（修幸存者偏差）；
 //     接收帧按 clientMsgId 严格配平：匹配/重复/非业务帧三类分桶，Type=4/5 事件
 //     与欢迎帧只进 unexpected 计数，不再灌进"接收 QPS"。
+//     注意：管线翻转后分发挂在落盘之后，skipBenchPersist=true 旁路档 echo 收不到帧。
 //   -mode conn ：只测长连接承载（仅 Type=3 心跳、零业务消息）：拨号时延直方图、
 //     掉线归因(read/write)、单连接成本。判据：持续 ≥2×timeout.DelayHeartbeat(120s)
 //     online 不衰减才算过。
+//   -mode ack  ：全链路闭环（野火"发送阶段"）：配平的帧是服务端 Type=6 ACK——
+//     落库成功且放大分发完成后才回，RTT=发送→落库→回执 全链路时延。
+//     必须 STORAGE_SKIPBENCHPERSIST=false 跑（该开关旁路时服务端永不回 ACK，超时全判丢）；
+//     数据会落开发库，跑完按 client_msg_id LIKE 'bench-%' 定向清理 message 表与 p_* 会话键。
+//     -timeout 建议 ≥3000ms（Kafka 同步往返 + 攒批 50ms + 批量 INSERT），ack 档 TPS 显著
+//     低于 echo 档是预期——那才是"全链路容量"（单分区+单消费者是分母），echo 只测网络+分发段。
+//     服务端应用层重投队列超限时会回 ACK Status=-1，单独计入"拒收"，不算完成。
 //
 // 容量判读 SLO：丢包率<0.1% 且 RTT P99<100ms 的档位下，最大"完成TPS"才是容量。
 // 推荐矩阵（打流端与服务同机时固定同参数，结果才可比）：
@@ -65,7 +77,7 @@ import (
 )
 
 var (
-	modeF       = flag.String("mode", "echo", "压测模式：echo=闭环自回显，conn=长连接承载(只心跳)")
+	modeF       = flag.String("mode", "echo", "压测模式：echo=闭环自回显，conn=长连接承载(只心跳)，ack=全链路(配平 Type=6 ACK)")
 	clientsN    = flag.Int("clients", 5000, "总连接数")
 	concurrency = flag.Int("concurrency", 200, "拨号并发(信号量；初始加压与重连共用)")
 	host        = flag.String("host", "127.0.0.1:8081", "目标服务地址")
@@ -78,12 +90,16 @@ var (
 
 const probeUID = 999999001 // 试探拨专用 uid，远离压测号段
 
+var ackMode bool // -mode ack：以 Type=6 ACK 为配平点（全链路）
+
 var (
 	online, dialOK, dialFail int64
 	// 建连成功后中途掉线的归因计数（不含建连失败；重连前计数）
 	droppedRead, droppedWrite int64
-	// attempted=发出的业务帧；echoOK=按 clientMsgId 配平成功的往返；lost=超时判丢
+	// attempted=发出的业务帧；echoOK=按 clientMsgId 配平成功的往返（echo 档=投递帧，ack 档=Type6 成功帧）；
+	// lost=超时判丢（含 ack 档 Status=-1 显式拒收，拒收另记 rejected）；dup=重复配平帧
 	attempted, echoOK, lost, dup, unexpected int64
+	rejected, ackSeen, peerCopy int64
 	inflightG               atomic.Int64 // 全体连接在途合计（增长=服务端消化不动的信号）
 	stopped                 atomic.Bool
 	stopCh                  = make(chan struct{})
@@ -161,11 +177,12 @@ type connState struct {
 
 func main() {
 	flag.Parse()
-	if *modeF != "echo" && *modeF != "conn" {
-		log.Fatalf("-mode 只支持 echo|conn，收到:%q", *modeF)
+	if *modeF != "echo" && *modeF != "conn" && *modeF != "ack" {
+		log.Fatalf("-mode 只支持 echo|conn|ack，收到:%q", *modeF)
 	}
+	ackMode = *modeF == "ack"
 	W := 0
-	if *modeF == "echo" {
+	if *modeF == "echo" || ackMode {
 		W = max(1, *windF)
 	}
 	dialSem = make(chan struct{}, max(1, *concurrency))
@@ -214,7 +231,7 @@ func probe() {
 	if err != nil {
 		if handshakeStatus(err) == 401 {
 			log.Fatalf("[试探拨] 服务端 401：auth.devSkipWSToken 未开启。请用 "+
-				"AUTH_DEVSKIPWSTOKEN=true STORAGE_SKIPBENCHPERSIST=true go run . 启动服务")
+				"AUTH_DEVSKIPWSTOKEN=true go run . 启动服务（echo/ack 档还须 STORAGE_SKIPBENCHPERSIST=false）")
 		}
 		log.Fatalf("[试探拨] 无法连接 %s：%v（服务端是否已启动？）", *host, err)
 	}
@@ -337,14 +354,34 @@ func runLive(conn *websocket.Conn, st *connState, W int) string {
 			}
 			var f struct {
 				ClientMsgId string `json:"clientMsgId"`
+				SrvClient   string `json:"ClientMsgId"` // Type=6 ACK 是 Go 侧 marshal，Pascal 键
+				Type        int    `json:"Type"`
+				Status      int    `json:"Status"`
 			}
-			if json.Unmarshal(data, &f) != nil || !strings.HasPrefix(f.ClientMsgId, st.idPrefix) {
-				atomic.AddInt64(&unexpected, 1) // 欢迎帧/Type=4/5 事件等，不进往返统计
+			if json.Unmarshal(data, &f) != nil {
+				atomic.AddInt64(&unexpected, 1) // 欢迎帧等非 JSON
 				continue
 			}
-			seq, e := strconv.ParseInt(strings.TrimPrefix(f.ClientMsgId, st.idPrefix), 10, 64)
+			cid := f.ClientMsgId
+			if cid == "" {
+				cid = f.SrvClient
+			}
+			if !strings.HasPrefix(cid, st.idPrefix) {
+				atomic.AddInt64(&unexpected, 1) // Type=4/5 事件等，不进往返统计
+				continue
+			}
+			seq, e := strconv.ParseInt(strings.TrimPrefix(cid, st.idPrefix), 10, 64)
 			if e != nil {
 				atomic.AddInt64(&unexpected, 1)
+				continue
+			}
+			isAck := f.Type == 6
+			if isAck != ackMode { // 另一类帧单独计数：ack 档的自投递副本 / echo 档的服务端回执
+				if isAck {
+					atomic.AddInt64(&ackSeen, 1)
+				} else {
+					atomic.AddInt64(&peerCopy, 1)
+				}
 				continue
 			}
 			L.Lock()
@@ -358,8 +395,13 @@ func runLive(conn *websocket.Conn, st *connState, W int) string {
 				continue
 			}
 			inflightG.Add(-1)
-			atomic.AddInt64(&echoOK, 1)
-			rttHist.record(time.Since(ts))
+			if isAck && f.Status != 0 { // 服务端显式拒收：计丢不计延（不进时延分位）
+				atomic.AddInt64(&rejected, 1)
+				atomic.AddInt64(&lost, 1)
+			} else {
+				atomic.AddInt64(&echoOK, 1)
+				rttHist.record(time.Since(ts))
+			}
 			select {
 			case wake <- struct{}{}:
 			default:
@@ -446,8 +488,14 @@ func monitor(W int) {
 			if e+l > 0 {
 				lossRate = float64(l) / float64(e+l) * 100
 			}
-			line += fmt.Sprintf(" [完成:%d/s 尝试:%d/s 在途:%d 丢包累计:%d(%.3f%%) dup:%d]",
-				(e-le)/2, (s-ls)/2, inflightG.Load(), l, lossRate, atomic.LoadInt64(&dup))
+			name := "回显"
+			if ackMode {
+				name = "ACK"
+			}
+			line += fmt.Sprintf(" [%s完成:%d/s 尝试:%d/s 在途:%d 丢包累计:%d(%.3f%%, 含拒收%d) dup:%d 旁帧:%d]",
+				name, (e-le)/2, (s-ls)/2, inflightG.Load(), l, lossRate,
+				atomic.LoadInt64(&rejected), atomic.LoadInt64(&dup),
+				atomic.LoadInt64(&ackSeen)+atomic.LoadInt64(&peerCopy))
 		}
 		if tick%5 == 0 { // 每 10s 附带直方图摘要
 			line += "\n        往返 " + rttHist.brief() + " | 拨号 " + dialHist.brief()
@@ -473,5 +521,10 @@ func summary() {
 		atomic.LoadInt64(&dialOK), atomic.LoadInt64(&dialFail),
 		atomic.LoadInt64(&droppedRead), atomic.LoadInt64(&droppedWrite), dialHist.brief())
 	log.Printf("判读：满足 丢包<0.1%% 且 P99<100ms 的档位中最大完成TPS 才算容量；在线数请对 netstat :8081 ESTABLISHED 真值")
-	log.Printf("全链路另测：STORAGE_SKIPBENCHPERSIST=false 重启服务，观察 Kafka LAG / MySQL 行数增速——WS 侧数字不反映落库能力")
+	if ackMode {
+		log.Printf("ack 档判读：RTT 含 落库+分发+ACK 全链路（echo 档 P99<100ms 的 SLO 不适用，建议看 3s 超时下的丢包率）；")
+		log.Printf("确认 STORAGE_SKIPBENCHPERSIST=false，否则永不回 ACK；压测数据按 client_msg_id LIKE 'bench-%%' 清理")
+	} else {
+		log.Printf("全链路另测：-mode ack（配平 Type=6，需 skipBenchPersist=false），观察完成TPS 与 Kafka LAG——WS 侧 echo 数字不反映落库能力")
+	}
 }

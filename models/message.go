@@ -20,7 +20,7 @@ type Message struct {
 	gorm.Model   // 冷存落库时 ID 主键显式写入雪花ID（53bit，兼容 JS 安全整数与 Redis float64 score）
 	UserId uint //发送者
 	TargetId int64 //接收者
-	Type int //1私聊、2群聊、3心跳
+	Type int //1私聊、2群聊、3心跳；4未读事件、5已读回执、6发送确认(ACK)——4/5/6 仅服务端→客户端
 	Media int //消息类型  文字、表情包、图片、音频
 	Content string //消息内容
 	CreateTime uint64 //创建时间
@@ -29,7 +29,8 @@ type Message struct {
 	Url string
 	Desc string
 	Amount int //其他数字统计（语音时长等，前端 JSON 字段名即 amount）
-	ClientMsgId string `gorm:"size:64"` //客户端生成的幂等键：Kafka 重放/客户端重发时经 Redis 集合去重（persistMessage）
+	ReadCount int //群聊逐条已读计数：MarkRead 按已读窗口 (old,seq] 给他人消息 +1，水位单调天然防重计
+	ClientMsgId string `gorm:"size:64"` //客户端生成的幂等键：重发/重放经 cm HASH 门禁去重，命中回补原 ACK（persistMessage）
 	Seq     int64  `gorm:"uniqueIndex:uk_conv_seq"` //会话内严格递增序号：排序/游标/未读用（与雪花主键 msgId 双轨）
 	ConvKey string `gorm:"uniqueIndex:uk_conv_seq;index"` //会话id（p_{小}_{大} / g_{群id}），唯一来源 convIdOf；与 Seq 组成复合唯一索引
 
@@ -50,7 +51,9 @@ type Node struct {
 	CurrentHub    *Hub    //记录当前的Node属于哪个分片
 }
 
-// 消息全链路：内存极速分发（WebSocket 低延迟） + Kafka 异步解耦持久化（冷热存储，见 store.go）
+// 消息全链路（先落盘、后投递——store-and-forward）：
+// WS 侧只做校验 + 同步投 Kafka（失败进应用层重投队列，超限才回 -1 ACK）；
+// 投递/未读/ACK 全部在"冷层写入成功"之后由 deliverLanded 放大（见 deliver.go / store.go）。
 
 func Chat(writer http.ResponseWriter,request *http.Request){
 	//1.获取参数并校验合法性
@@ -174,8 +177,14 @@ func recvProc(node *Node) {
 			continue
 		}
 
-		// 第一步：内存极速路由！不再通过 MsgQueue 阻挡 WebSocket 发送，而是瞬间派发
-		dispatch(data)
+		// 结构校验：参数非法即时回 -1 ACK（不入库、不重投——"参数非法"与"存储故障"语义分开），不断连
+		if verr := validateMsg(&msg); verr != nil {
+			ackTo(node.UserId, msg.ClientMsgId, convIdForAck(&msg), 0, 0, -1, verr.Error())
+			continue
+		}
+
+		// 唯一动作：校验通过后同步入持久化管线（投递/ACK 在落盘成功后由消费侧完成）
+		dispatchTo(data, node.UserId)
 	}
 }
 
@@ -216,36 +225,53 @@ func udpRevProc(){
 	}
 }
 
-//后端调度逻辑处理
+//后端调度逻辑处理（UDP 旁路：无 ACK 归属，失败仅日志）
 func dispatch(data []byte){
-	msg:=Message{}
-	err:=json.Unmarshal(data,&msg)
-	if err!=nil{
+	dispatchTo(data, 0)
+}
+
+// dispatchTo 业务消息进入持久化管线的唯一路径：只做同步入队（produceOrDefer，
+// 失败进应用层重投队列）。投递/未读/ACK 全部移到"冷层写入成功"之后的 deliverLanded——
+// 这是"先落盘再投递、端到端可靠"的顺序闸门，WS 侧不再直接投递任何消息。
+func dispatchTo(data []byte, ackUid int64) {
+	msg := Message{}
+	if err := json.Unmarshal(data, &msg); err != nil {
 		fmt.Println(err)
 		return
 	}
-	switch msg.Type{
-	 case 1:
-		//fmt.Println("dispatch  data :", string(data))
-		sendMsg(int64(msg.TargetId),data)   //私信
-	 case 2:
-		//群消息持久化"一条一份"进 g_{群id}（此前每个收件人扇出重复投 Kafka，会在同一会话落 N 份拷贝）；
-		//实时投递仍按成员逐个内存分发
-		utils.SendMsgToKafka(data)
-		sendGroupMsg(int64(msg.TargetId), data)   //群发
-	// case 3:sendAllMsg()        //广播
-	// case 4:                //其他
-
+	switch msg.Type {
+	case 1, 2:
+		if ackUid <= 0 {
+			ackUid = int64(msg.UserId) // UDP 等无连接归属的路径按帧内 UserId 回执（尽力而为）
+		}
+		produceOrDefer(ackUid, &msg, data)
 	}
 }
-func sendMsg(userId int64, msgData []byte) {
-	// 【架构核心：两阶段投递】
-	// 第一阶段：内存分发零延迟，瞬间送给 Hub 下发给用户。
-	deliverLocal(userId, msgData)
 
-	// 第二阶段：通过 Kafka 跨进程投递给消费者组，冷热双层落存储。
-	// 哪怕 Go 服务崩溃重启，消息也不会丢！
-	utils.SendMsgToKafka(msgData)
+// validateMsg 结构校验（WS 入口）。约定：业务消息必须携带 clientMsgId——
+// 它是幂等键，也是 ACK 关联的唯一凭据，缺失则服务端无法承诺"发后必有所谓"。
+func validateMsg(m *Message) error {
+	if m.Type != 1 && m.Type != 2 {
+		return fmt.Errorf("未知消息类型: %d", m.Type)
+	}
+	if m.TargetId <= 0 {
+		return fmt.Errorf("TargetId 非法")
+	}
+	if m.Content == "" && m.Url == "" && m.Pic == "" {
+		return fmt.Errorf("消息体为空")
+	}
+	if m.ClientMsgId == "" {
+		return fmt.Errorf("缺少 clientMsgId(幂等与 ACK 关联必需)")
+	}
+	return nil
+}
+
+// convIdForAck 为校验失败的帧尽量推导会话 id；类型不可识别时返回空串。
+func convIdForAck(m *Message) string {
+	if m.Type != 1 && m.Type != 2 {
+		return ""
+	}
+	return convIdOf(m.Type, int64(m.UserId), m.TargetId)
 }
 
 // deliverLocal 仅做内存分发（欢迎语等系统提示使用，不进持久化链路）
@@ -275,6 +301,7 @@ func JoinGroup(userId uint, comId string) (int, string) {
 	} else {
 		contact.TargetId = community.ID
 		utils.DB.Create(&contact)
+		CacheGroupMember(community.ID, userId) // g_members 缓存即时补员（退群/解散靠 TTL 最终一致）
 		return 0, "加群成功"
 	}
 }
@@ -296,23 +323,8 @@ func RedisMsg(convId string, start int64, end int64, isRev bool) []string {
 	return rels
 }
 
-func sendGroupMsg(targetId int64,msg []byte ){
-	fmt.Println("开始群发消息")
-	//解析发送者：群消息不再回显给发送者本人
-	//（旧代码误拿群 id 与成员 id 比较，导致自己收到自己发的消息并产生 msg_自己_自己 的持久化副本）
-	m := Message{}
-	if err := json.Unmarshal(msg, &m); err != nil {
-		fmt.Println(err)
-		return
-	}
-	userIds :=SearchUserByGroupId(uint(targetId))
-	for i:=0;i<len(userIds);i++{
-		//排除发送者自己；仅内存分发（持久化已在 dispatch 里统一做一次）
-		if int64(m.UserId) != int64(userIds[i]){
-			deliverLocal(int64(userIds[i]),msg)
-		}
-	}
-}
+//sendGroupMsg 已废弃：群扇出移至落盘成功后的 deliverLanded（models/deliver.go）——
+//消费者按 g_members 缓存逐人投递 + 未读，杜绝"先投递后落库"，也不回显发送者本人（其状态走 Type=6 ACK）。
 	//需要重写此方法才能完整的msg转byte[]
 func (msg Message) MarshalBinary() ([]byte, error) {
 	return json.Marshal(msg)

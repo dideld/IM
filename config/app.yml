@@ -14,8 +14,9 @@ storage:
   hotKeep: 200        # Redis 热层单会话保留的最大消息条数（超出修剪最旧的）
   hotTTLDays: 7       # 热层 ZSet 滑动过期天数
   coldBatchSize: 100  # MySQL 冷存储批量落盘条数
-  coldFlushMs: 200    # 冷存储批量落盘最长等待毫秒
-  skipBenchPersist: true  # 压测专用：clientMsgId 以 bench- 开头的消息跳过冷热存储（默认关，生产严禁常开）
+  coldFlushMs: 50     # 冷存储批量落盘最长等待毫秒（先落盘再投递后，此值直接叠加到消息端到端时延）
+  coldMode: batch     # batch=攒批落库成功后才投递(高吞吐) | inline=单条立即写(低时延)。两档都强制"冷层写成功"闸门
+  skipBenchPersist: false  # 压测专用：clientMsgId 以 bench- 开头的消息跳过冷热存储（默认关，生产严禁常开；bench ack 档必须关）
 timeout:
   DelayHeartbeat: 60   #延迟心跳时间  单位秒
 auth:
@@ -28,3 +29,6 @@ port:
 upload:
   path: "./asset/upload"
   maxSizeMB: 10        #单文件上传大小上限(MB)
+push:
+  enabled: false       #离线推送挂点总开关（PushAdapter 未注册实现时开了也无外呼，见 utils/push.go；关闭不影响"未读+拉取"补偿）
+  debug: false         #打印离线判定 stub 日志（会触发 Hub 在线探测，压测档勿开）
