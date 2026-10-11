@@ -9,6 +9,9 @@ asset/upload/*
 cache/
 *.log
 
+# 配置文件（含数据库密码等敏感信息，本地维护不入库；模板见 config/app.yml.example）
+config/app.yml
+
 # IDE / OS
 .idea/
 .DS_Store

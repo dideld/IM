@@ -195,12 +195,40 @@ func persistMessage(msgData []byte) error {
 		return nil
 	}
 	rec.done = make(chan error, 1)
-	coldCh <- rec // 队列满则反压消费者（宁慢勿丢）
+	if err := enqueueCold(rec); err != nil {
+		return err // 停机放弃入队：offset 不提交，重启后由 Kafka 重放（幂等门禁兜底）
+	}
 	if err := <-rec.done; err != nil {
-		return nil // 冷 writer 已完成 failLanded（清标记/死信/错误 ACK）
+		return nil // 冷 writer 已完成 failLanded（回滚热层/清标记/死信/错误 ACK）
 	}
 	return nil
 }
+
+// enqueueCold 入冷队列：队列满=存储管道停摆（MySQL 不可用等），此时**正确行为就是停住消费者**
+// （Kafka 天然缓冲、offset 不提交），但必须出声——每 5s 一条【警告】，并响应停机信号。
+func enqueueCold(rec landedRecord) error {
+	stallTicker := time.NewTicker(5 * time.Second)
+	defer stallTicker.Stop()
+	for {
+		select {
+		case coldCh <- rec:
+			return nil
+		case <-stallTicker.C:
+			fmt.Printf("【警告】冷管道停摆：coldCh %d/%d 满，Kafka 消费者暂停(offset 未提交靠重放)，检查 MySQL！\n",
+				len(coldCh), cap(coldCh))
+		}
+		if utils.KafkaStopping() {
+			// 停机中放弃入队：清去重占位让重放走全新落库，返回 error 使 offset 不提交
+			if rec.clientMsgId != "" {
+				utils.Red.HDel(context.Background(), "cm:"+rec.convId, rec.clientMsgId)
+			}
+			return fmt.Errorf("shutting down, 放弃入队待重放: %s", rec.clientMsgId)
+		}
+	}
+}
+
+// ColdQueueLen 冷队列水位（monitor 观测用）
+func ColdQueueLen() (int, int) { return len(coldCh), cap(coldCh) }
 
 // redIncrRetry seq 发号带小重试：区分"瞬时抖动"和"持续不可用"，前者靠 Kafka 重投自愈。
 func redIncrRetry(ctx context.Context, key string) (int64, error) {
@@ -333,7 +361,7 @@ func convPeer(convId string, uid int64) int64 {
 //  1. Redis 游标 + 清未读（游标先取旧值，群聊逐条计数要用窗口 (old, max]）；
 //  2. 游标 upsert 落库；
 //  3. 私聊：回填对端消息 read_time + 向对端推 Type=5；
-//  4. 群聊（逐条回执已落地）：新已读窗口内他人消息 read_count+1（水位单调天然防重计），
+//  4. 群聊（逐条回执已落地）：新已读窗口内他人消息 read_count+1（markReadWindowTx 行锁串行防双计），
 //     并向除已读者外的全体在线成员推 Type=5 {ReadSeq, Reader}，前端按 Reader 去重聚成"N 人已读"。
 //
 // markRead 频率低（开会话/收到新消息时），同步写库可接受；若上量改走独立批量 channel。
@@ -343,7 +371,6 @@ func MarkRead(userId int64, convId string) {
 	}
 	ctx := context.Background()
 	max, _ := utils.Red.Get(ctx, seqKeyPrefix+convId).Result()
-	old := getReadCursor(userId, convId) // 必须在覆盖游标前取旧水位
 
 	pipe := utils.Red.Pipeline()
 	pipe.HDel(ctx, unreadKeyPrefix+strconv.FormatInt(userId, 10), convId)
@@ -358,16 +385,15 @@ func MarkRead(userId int64, convId string) {
 	}
 	seq, _ := strconv.ParseInt(max, 10, 64)
 
-	// 游标落库（复合唯一 user_id+conv_key，冲突则前移）
-	err := utils.DB.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "user_id"}, {Name: "conv_key"}},
-		DoUpdates: clause.Assignments(map[string]interface{}{"last_seq": seq, "updated_at": time.Now()}),
-	}).Create(&ReadCursor{UserId: uint(userId), ConvKey: convId, LastSeq: seq}).Error
-	if err != nil {
-		fmt.Println("read cursor upsert failed:", err)
-	}
-
 	if strings.HasPrefix(convId, "p_") {
+		// 游标落库（复合唯一 user_id+conv_key，冲突则前移）
+		err := utils.DB.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "user_id"}, {Name: "conv_key"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{"last_seq": seq, "updated_at": time.Now()}),
+		}).Create(&ReadCursor{UserId: uint(userId), ConvKey: convId, LastSeq: seq}).Error
+		if err != nil {
+			fmt.Println("read cursor upsert failed:", err)
+		}
 		// 私聊：把游标之前、对方发给我的消息回填 read_time
 		res := utils.DB.Model(&Message{}).
 			Where("conv_key = ? AND seq > 0 AND seq <= ? AND user_id <> ? AND read_time = 0", convId, seq, userId).
@@ -385,17 +411,15 @@ func MarkRead(userId int64, convId string) {
 		return
 	}
 
-	// 群聊逐条已读回执
-	if strings.HasPrefix(convId, "g_") && seq > old {
+	// 群聊逐条已读回执：窗口计数在事务内串行化（A4），广播走 g_members 缓存
+	if strings.HasPrefix(convId, "g_") {
+		old := markReadWindowTx(userId, convId, seq)
+		if seq <= old {
+			return // 多端并发时水位已被推进，本次窗口为空，免打扰广播
+		}
 		gid, e := strconv.ParseUint(convId[2:], 10, 32)
 		if e != nil {
 			return
-		}
-		res := utils.DB.Model(&Message{}).
-			Where("conv_key = ? AND seq > ? AND seq <= ? AND user_id <> ?", convId, old, seq, userId).
-			UpdateColumn("read_count", gorm.Expr("read_count + 1"))
-		if res.Error != nil {
-			fmt.Println("group read_count window update failed:", res.Error)
 		}
 		evt, err := json.Marshal(map[string]interface{}{"Type": 5, "ConvId": convId, "ReadSeq": seq, "Reader": userId})
 		if err != nil {
@@ -407,6 +431,42 @@ func MarkRead(userId int64, convId string) {
 			}
 		}
 	}
+}
+
+// markReadWindowTx 群已读窗口计数的事务化串行（A4：修复双开标签页并发 MarkRead 双计 read_count）。
+// 顺序讲究：先"占位 upsert"（ON DUPLICATE 原值自赋值）保证行存在并拿住 X 行锁——
+// 直接对不存在的行 SELECT FOR UPDATE 在 RR 下锁的是间隙，两个首读事务会互相死锁；
+// 再 SELECT FOR UPDATE 取权威旧水位 → (old, seq] 窗口 +1 → 前移水位。
+func markReadWindowTx(userId int64, convId string, seq int64) int64 {
+	var old int64
+	err := utils.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "user_id"}, {Name: "conv_key"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{"last_seq": gorm.Expr("last_seq")}),
+		}).Create(&ReadCursor{UserId: uint(userId), ConvKey: convId}).Error; err != nil {
+			return err
+		}
+		var rc ReadCursor
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("user_id = ? AND conv_key = ?", userId, convId).First(&rc).Error; err != nil {
+			return err
+		}
+		old = int64(rc.LastSeq)
+		if seq <= old {
+			return nil
+		}
+		if err := tx.Model(&Message{}).
+			Where("conv_key = ? AND seq > ? AND seq <= ? AND user_id <> ?", convId, old, seq, userId).
+			UpdateColumn("read_count", gorm.Expr("read_count + 1")).Error; err != nil {
+			return err
+		}
+		return tx.Model(&ReadCursor{}).Where("id = ?", rc.ID).
+			UpdateColumns(map[string]interface{}{"last_seq": seq, "updated_at": time.Now()}).Error
+	})
+	if err != nil {
+		fmt.Println("markReadWindowTx failed:", err)
+	}
+	return old
 }
 
 // PeerReadSeq 会话对端的已读游标（私聊气泡"已读"状态用）：Redis 优先，缺则回落 DB。
@@ -518,8 +578,8 @@ func coldInsertRetry(batch []landedRecord) error {
 		err = r.Error
 		if err == nil {
 			if r.RowsAffected < int64(len(msgs)) {
-				// 冲突跳过的行要大声告警：多实例 workerId 重复或重放会在这里体现
-				fmt.Printf("【警告】冷存储 %d/%d 条冲突被跳过（重放或 workerId 重复）：检查 snowflake.workerId！\n",
+				// 冲突跳过的行要大声告警：workerId 撞号（不同消息同 ID）与 Redis 丢失后的重放（同 clientMsgId）都会到这里
+				fmt.Printf("【警告】冷存储 %d/%d 条唯一冲突被跳过：排查多实例 snowflake.workerId 重复，或 Redis 丢失后 Kafka 重放（由 uk_conv_cmid 拦截）\n",
 					int64(len(msgs))-r.RowsAffected, len(msgs))
 			}
 			return nil

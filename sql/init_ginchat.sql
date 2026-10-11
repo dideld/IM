@@ -65,7 +65,8 @@ CREATE TABLE `message` (
   PRIMARY KEY (`id`),
   KEY `idx_message_deleted_at` (`deleted_at`),
   KEY `idx_message_conv_key` (`conv_key`),
-  UNIQUE KEY `uk_conv_seq` (`conv_key`,`seq`)
+  UNIQUE KEY `uk_conv_seq` (`conv_key`,`seq`),
+  UNIQUE KEY `uk_conv_cmid` (`conv_key`,`client_msg_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 
 -- 会话已读游标（Redis read: 键的持久账本；私聊 read_time 回填与 Type=5 回执依据）

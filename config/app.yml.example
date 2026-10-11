@@ -1,0 +1,62 @@
+# GinChat 配置模板 —— 复制为 app.yml 后填入真实值
+# 所有环境变量可通过 AUTOMAXPROCS / MYSQL_DNS / REDIS_ADDR 等覆盖（点号→下划线）
+
+app: GinChat
+
+# ---- 服务端口 ----
+port:
+  server: ":8080"
+  udp: 3001
+
+# ---- MySQL ----
+mysql:
+  dns: "root:YOUR_PASSWORD@tcp(host.docker.internal:3306)/ginchat?charset=utf8mb4&parseTime=True&loc=Local"
+
+# ---- Redis ----
+redis:
+  addr: "host.docker.internal:6379"
+  password: ""
+  DB: 0
+  poolSize: 10
+  minIdleConn: 5
+
+# ---- Kafka ----
+kafka:
+  broker: "host.docker.internal:9092"
+  topic: "chat_messages"
+  consumerGroup: "chat_redis_saver_group"
+
+# ---- 雪花算法 ----
+snowflake:
+  workerId: 1   # 0~31，多实例必须逐实例配置不同值
+
+# ---- 心跳超时 ----
+timeout:
+  DelayHeartbeat: 60   # 秒
+
+# ---- 冷热存储 ----
+storage:
+  coldMode: "batch"      # batch | inline
+  coldBatchSize: 100
+  coldFlushMs: 50
+  hotKeep: 200           # 热层单会话保留条数
+  hotTTLDays: 7
+  skipBenchPersist: false
+
+# ---- 离线推送（挂点，厂商实现未接）----
+push:
+  enabled: false
+  debug: false
+
+# ---- 会话鉴权 ----
+auth:
+  devSkipWSToken: false  # 压测专用，生产严禁开启
+
+# ---- 上传 ----
+upload:
+  path: "./asset/upload"
+  maxSizeMB: 10
+
+# ---- Hub ----
+hub:
+  maxDevices: 5          # 单用户最大在线设备数

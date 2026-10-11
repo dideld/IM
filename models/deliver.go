@@ -16,6 +16,7 @@ import (
 	"webapp/utils"
 
 	"github.com/spf13/viper"
+	"golang.org/x/sync/singleflight"
 )
 
 // ackTo 向发送者全部在线设备推 Type=6 服务端确认帧（仅服务端→客户端）。
@@ -72,11 +73,21 @@ func deliverLanded(recs []landedRecord) {
 	}
 }
 
-// failLanded 落库失败收口：清去重标记（允许该 clientMsgId 未来重新落库）→ 死信留证 → 错误 ACK-1。
+// failLanded 落库失败收口：回滚热层（A2：冷是全集，热的不可丢副本必须一并撤，
+// 否则 historyMsg 看不到的消息会泄漏进热层结果）→ 清去重标记（允许该 clientMsgId 未来重新落库）
+// → 死信留证 → 错误 ACK-1。
 // 调用后消费者照常提交 offset——毒消息不无限占住分区，失败责任移交死信与客户端。
 func failLanded(rec landedRecord, reason string) {
+	// 按 member 精确删除（raw 即热层写入时的 member），再按 score 兜底一次
+	ctx := context.Background()
+	if err := utils.Red.ZRem(ctx, rec.convId, string(rec.raw)).Err(); err != nil {
+		fmt.Println("failLanded ZRem(member) failed:", err)
+	}
+	utils.Red.ZRemRangeByScore(ctx, rec.convId,
+		strconv.FormatFloat(float64(rec.seq), 'f', -1, 64),
+		strconv.FormatFloat(float64(rec.seq), 'f', -1, 64))
 	if rec.clientMsgId != "" {
-		utils.Red.HDel(context.Background(), "cm:"+rec.convId, rec.clientMsgId)
+		utils.Red.HDel(ctx, "cm:"+rec.convId, rec.clientMsgId)
 	}
 	dlqHold(rec, reason)
 	ackTo(int64(rec.parsed.UserId), rec.clientMsgId, rec.convId, rec.seq, rec.msgId, -1, reason)
@@ -175,49 +186,97 @@ func startProducePump() {
 
 // ===== 群成员缓存（g_members:{gid}）=====
 
-// GroupMembers 群成员列表：Redis SET 优先，miss 回落 DB 并回填（TTL 24h）。
-// 落盘后置分发后，群消息每条都会在消费路径查成员，必须走缓存；
-// JoinGroup 即时 SAdd 入缓存；退群/解散等删减路径靠 TTL 最终一致（练手期可接受）。
+// gmSf 防击穿：Redis 重启/过期后的 miss 风暴里，每个群同一时刻只有一个请求回源 DB。
+var gmSf singleflight.Group
+
+const (
+	gmTTL        = 15 * time.Minute // 正缓存：短 TTL 换成员变更的最终一致窗口（分发路径高频，DB 回源成本可忽略）
+	gmNegTTL     = 30 * time.Second // 负缓存哨兵（哨兵成员 "0"，uid 恒 >0 不冲突）
+	gmNegMember  = "0"
+	gmKeyPrefixK = "g_members:"
+)
+
+// GroupMembers 群成员列表：Redis SET 优先，miss 经 singleflight 回落 DB 并回填。
+// JoinGroup/CacheGroupMember 即时 SAdd 补员；成员移除路径（未来的退群/解散）应调 InvalidateGroup，
+// 未显式失效时靠 15min TTL 收敛（较旧 24h 大幅收窄不一致窗口）。
 func GroupMembers(gid uint) []int64 {
 	ctx := context.Background()
-	key := "g_members:" + strconv.FormatUint(uint64(gid), 10)
+	key := gmKeyPrefixK + strconv.FormatUint(uint64(gid), 10)
 	ids, err := utils.Red.SMembers(ctx, key).Result()
-	if err == nil && len(ids) > 0 {
-		out := make([]int64, 0, len(ids))
-		for _, s := range ids {
-			if n, e := strconv.ParseInt(s, 10, 64); e == nil {
-				out = append(out, n)
-			}
+	if err == nil {
+		if len(ids) == 1 && ids[0] == gmNegMember {
+			return nil // 负缓存命中：空群，不回源
 		}
+		out := parseMemberIds(ids)
 		if len(out) > 0 {
 			return out
 		}
 	}
-	members := SearchUserByGroupId(gid)
-	if len(members) == 0 {
-		return nil
-	}
-	vals := make([]interface{}, 0, len(members))
-	out := make([]int64, 0, len(members))
-	for _, m := range members {
-		vals = append(vals, int64(m))
-		out = append(out, int64(m))
-	}
-	pipe := utils.Red.Pipeline()
-	pipe.SAdd(ctx, key, vals...)
-	pipe.Expire(ctx, key, 24*time.Hour)
-	if _, err := pipe.Exec(ctx); err != nil {
-		fmt.Println("g_members cache write failed:", err)
+	// miss / Redis 故障 → singleflight 回源（故障时并发请求各回各的源也无妨，Do 内部合并正常路径）
+	v, _, _ := gmSf.Do(key, func() (interface{}, error) {
+		members := SearchUserByGroupId(gid)
+		pipe := utils.Red.Pipeline()
+		if len(members) == 0 {
+			pipe.SAdd(ctx, key, gmNegMember)
+			pipe.Expire(ctx, key, gmNegTTL)
+		} else {
+			vals := make([]interface{}, 0, len(members))
+			for _, m := range members {
+				vals = append(vals, int64(m))
+			}
+			pipe.SAdd(ctx, key, vals...)
+			pipe.Expire(ctx, key, gmTTL)
+		}
+		if _, e := pipe.Exec(ctx); e != nil {
+			fmt.Println("g_members cache refill failed:", e)
+		}
+		out := make([]int64, 0, len(members))
+		for _, m := range members {
+			out = append(out, int64(m))
+		}
+		return out, nil
+	})
+	out, _ := v.([]int64)
+	return out
+}
+
+func parseMemberIds(ids []string) []int64 {
+	out := make([]int64, 0, len(ids))
+	for _, s := range ids {
+		if s == gmNegMember {
+			continue
+		}
+		if n, e := strconv.ParseInt(s, 10, 64); e == nil {
+			out = append(out, n)
+		}
 	}
 	return out
 }
 
-// CacheGroupMember 加群成功时的即时缓存写入点。
+// CacheGroupMember 加群成功时的即时缓存写入点（key 可能已过期/为负缓存，SAdd 后统一带上 TTL，
+// 负缓存哨兵一并清掉防止"刚加群却被空集挡 30s"）。
 func CacheGroupMember(gid, uid uint) {
 	if gid == 0 || uid == 0 {
 		return
 	}
-	utils.Red.SAdd(context.Background(), "g_members:"+strconv.FormatUint(uint64(gid), 10), int64(uid))
+	ctx := context.Background()
+	key := gmKeyPrefixK + strconv.FormatUint(uint64(gid), 10)
+	pipe := utils.Red.Pipeline()
+	pipe.SRem(ctx, key, gmNegMember)
+	pipe.SAdd(ctx, key, int64(uid))
+	pipe.Expire(ctx, key, gmTTL)
+	if _, err := pipe.Exec(ctx); err != nil {
+		fmt.Println("CacheGroupMember failed:", err)
+	}
+}
+
+// InvalidateGroup 成员发生变更（退群/解散）时的显式失效点——当前项目尚无退群路径，
+// 新增相关功能时**必须**调用本函数，否则最长 15min 内仍会向旧成员表扇出。
+func InvalidateGroup(gid uint) {
+	if gid == 0 {
+		return
+	}
+	utils.Red.Del(context.Background(), gmKeyPrefixK+strconv.FormatUint(uint64(gid), 10))
 }
 
 // getReadCursor 已读水位：Redis read: 键优先，缺失回落 DB 账本（user_read_cursor）。

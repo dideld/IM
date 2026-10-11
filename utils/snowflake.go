@@ -2,6 +2,7 @@ package utils
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -49,6 +50,29 @@ func GenSnowflakeId() int64 {
 	defer sfWorker.mu.Unlock()
 
 	now := time.Now().UnixNano() / 1e6
+	// 时钟回拨防御（B3）：小回拨（≤2s）有界自旋等追上并告警一次；
+	// 大回拨"借时不回头"——沿用旧时间戳继续推进序列，保证 ID 单调、绝不长时间卡死发号路径。
+	if now < sfWorker.timestamp {
+		offset := sfWorker.timestamp - now
+		if offset <= 2000 {
+			fmt.Printf("【告警】时钟回拨 %dms，有界等待追平\n", offset)
+			for now < sfWorker.timestamp {
+				time.Sleep(time.Duration(sfWorker.timestamp-now) * time.Millisecond)
+				now = time.Now().UnixNano() / 1e6
+			}
+		} else {
+			fmt.Printf("【告警】时钟大幅回拨 %dms，借时间戳维持 ID 单调\n", offset)
+			now = sfWorker.timestamp
+			sfWorker.number++
+			if sfWorker.number > numberMax {
+				sfWorker.number = 0
+				sfWorker.timestamp++
+				now = sfWorker.timestamp
+			}
+			ID := int64((now-epoch)<<timeShift | (sfWorker.workerId << workerShift) | (sfWorker.number))
+			return ID
+		}
+	}
 	if sfWorker.timestamp == now {
 		sfWorker.number++
 		if sfWorker.number > numberMax {

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -15,10 +16,12 @@ import (
 )
 
 var (
-	KafkaWriter *kafka.Writer
-	kafkaReader *kafka.Reader
-	kafkaQuit   chan struct{}
-	kafkaOnce   sync.Once
+	KafkaWriter      *kafka.Writer
+	kafkaReader      *kafka.Reader
+	kafkaQuit        chan struct{}
+	kafkaOnce        sync.Once
+	kafkaStopping    atomic.Bool    // 停机信号：消费者入队前检查，模型层靠它放弃入队走重放
+	kafkaConsumerDone chan struct{} // 消费者协程退出握手（A7：排空冷队列前必须确认无人再入队）
 )
 
 // kafkaConf 读取 kafka.* 配置，缺省时回退本地开发默认值（保证删掉配置也能起服务）
@@ -109,6 +112,8 @@ func SendMsgToKafka(msgData []byte) {
 func StartKafkaConsumer(consumeHandler func([]byte) error) {
 	kafkaQuit = make(chan struct{})
 	kafkaOnce = sync.Once{}
+	kafkaConsumerDone = make(chan struct{})
+	kafkaStopping.Store(false)
 	kafkaReader = kafka.NewReader(kafka.ReaderConfig{
 		Brokers: []string{kafkaConf("broker", "host.docker.internal:9092")},
 		GroupID: kafkaConf("consumerGroup", "chat_redis_saver_group"), // 支持横向扩展，开再多服也是同一个组排队
@@ -121,6 +126,7 @@ func StartKafkaConsumer(consumeHandler func([]byte) error) {
 	fmt.Println("Kafka Consumer (Reader) Started and Listening...")
 
 	go func() {
+		defer close(kafkaConsumerDone) // 退出握手：A7 排空冷队列前必须等到这里
 		ctx := context.Background()
 		for {
 			select {
@@ -158,14 +164,31 @@ func StartKafkaConsumer(consumeHandler func([]byte) error) {
 	}()
 }
 
-// CloseKafka 优雅停机：停消费循环、关 reader 与 writer
-func CloseKafka() {
-	if kafkaQuit != nil {
-		kafkaOnce.Do(func() { close(kafkaQuit) })
+// KafkaStopping 停机信号（模型层入队前检查：停摆等待中收到信号则放弃入队、offset 不提交走重放）
+func KafkaStopping() bool { return kafkaStopping.Load() }
+
+// StopKafkaConsumer 停机第一步：发信号并等待消费者协程真正退出（≤10s），再关 reader。
+// 只有确认无人再向 coldCh 入队，StopColdWriter 的"排空"才是可终结的。
+func StopKafkaConsumer() {
+	if kafkaQuit == nil {
+		return
+	}
+	kafkaStopping.Store(true)
+	kafkaOnce.Do(func() { close(kafkaQuit) })
+	if kafkaConsumerDone != nil {
+		select {
+		case <-kafkaConsumerDone:
+		case <-time.After(10 * time.Second):
+			fmt.Println("【警告】Kafka 消费者退出超时，强制继续停机")
+		}
 	}
 	if kafkaReader != nil {
 		kafkaReader.Close()
 	}
+}
+
+// CloseKafkaProducer 停机最后一步：关生产者（须在冷 writer 排空之后——收尾期的分发/ACK 不再产生新投递需求）
+func CloseKafkaProducer() {
 	if KafkaWriter != nil {
 		KafkaWriter.Close()
 	}

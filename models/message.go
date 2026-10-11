@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 	"webapp/utils"
 
@@ -29,10 +30,10 @@ type Message struct {
 	Url string
 	Desc string
 	Amount int //其他数字统计（语音时长等，前端 JSON 字段名即 amount）
-	ReadCount int //群聊逐条已读计数：MarkRead 按已读窗口 (old,seq] 给他人消息 +1，水位单调天然防重计
-	ClientMsgId string `gorm:"size:64"` //客户端生成的幂等键：重发/重放经 cm HASH 门禁去重，命中回补原 ACK（persistMessage）
-	Seq     int64  `gorm:"uniqueIndex:uk_conv_seq"` //会话内严格递增序号：排序/游标/未读用（与雪花主键 msgId 双轨）
-	ConvKey string `gorm:"uniqueIndex:uk_conv_seq;index"` //会话id（p_{小}_{大} / g_{群id}），唯一来源 convIdOf；与 Seq 组成复合唯一索引
+	ReadCount int //群聊逐条已读计数：MarkRead 在事务内以 (old,seq] 窗口给他人消息 +1（markReadWindowTx 行锁串行防双计）
+	ClientMsgId string `gorm:"size:64;uniqueIndex:uk_conv_cmid,priority:2"` //客户端幂等键：cm HASH 为近窗门禁，DB 复合唯一 (conv_key, client_msg_id) 是"Redis 数据丢失+重放"时的最终防线（UDP 旁路产生的空值行不判重）
+	Seq     int64  `gorm:"uniqueIndex:uk_conv_seq,priority:2"` //会话内严格递增序号：排序/游标/未读用（与雪花主键 msgId 双轨）
+	ConvKey string `gorm:"uniqueIndex:uk_conv_seq,priority:1;uniqueIndex:uk_conv_cmid,priority:1;index"` //会话id（p_{小}_{大} / g_{群id}），唯一来源 convIdOf；两组复合唯一索引的首列
 
 }
 func (table *Message)TableName()string{
@@ -49,6 +50,42 @@ type Node struct {
 	DataQueue     chan []byte     //消息
 	GroupSets     set.Interface   //好友 / 群
 	CurrentHub    *Hub    //记录当前的Node属于哪个分片
+	hbGen         atomic.Int64 //心跳代数：每次续期 +1；超时任务执行时比对，防"刚续期就被旧任务踢"
+}
+
+// hbKey 时间轮心跳任务的键：按"用户#设备"隔离——多端共享一个键时，
+// 任一设备的心跳会替其他设备续命/误踢最后心跳的那台（P0 修复）。
+// 命名空间 hb: 前缀，与 double_delete_ 等键不冲突。
+func hbKey(node *Node) string {
+	return "hb:" + strconv.FormatInt(node.UserId, 10) + "#" + node.DeviceId
+}
+
+// heartbeatKick 安装/刷新本设备的心跳超时任务（O(1)），代数守卫丢弃已续期的陈旧踢线
+func heartbeatKick(node *Node) {
+	delay := time.Duration(viper.GetInt("timeout.DelayHeartbeat")) * time.Second
+	if delay <= 0 {
+		delay = 60 * time.Second
+	}
+	gen := node.hbGen.Add(1)
+	utils.TW.AddTask(delay, hbKey(node), func() {
+		if node.hbGen.Load() != gen {
+			return // 期间已有心跳，本任务过期
+		}
+		if node.Conn != nil {
+			node.Conn.Close()
+		}
+		if node.CurrentHub != nil {
+			node.CurrentHub.unregister <- node
+		}
+	})
+}
+
+// maxDevicesPerUser 单用户设备数上限（hub.maxDevices，缺省 5）
+func maxDevicesPerUser() int {
+	if n := viper.GetInt("hub.maxDevices"); n > 0 {
+		return n
+	}
+	return 5
 }
 
 // 消息全链路（先落盘、后投递——store-and-forward）：
@@ -67,6 +104,13 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 		http.Error(writer, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	// 设备数软限（A6）： Upgrade 前经 probe 探测"除本设备外"的在线设备数，超限给体面的 403；
+	// 探测超时按放行处理，注册处（hub.Run）还有硬上限兜底竞态窗口。
+	deviceId := query.Get("deviceId")
+	if n := WsHub.DeviceCount(userId, deviceId); n >= maxDevicesPerUser() {
+		http.Error(writer, "device limit exceeded", http.StatusForbidden)
+		return
+	}
 	isvalida:=true
 	conn,err:=(&websocket.Upgrader{
 		//token校验
@@ -83,7 +127,7 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 	//4.userid和node绑定并加锁
 	node := &Node{
 		UserId:        userId,
-		DeviceId:      query.Get("deviceId"),
+		DeviceId:      deviceId,
 		Token:         token,
 		Conn:          conn,
 		DataQueue:     make(chan []byte, 1024),
@@ -93,18 +137,7 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 	targetHub.register <- node
 
 	// 注册初始心跳任务到时间轮
-	delay := time.Duration(viper.GetInt("timeout.DelayHeartbeat")) * time.Second
-	if delay <= 0 {
-		delay = 60 * time.Second
-	}
-	utils.TW.AddTask(delay, userId, func() {
-		if node.Conn != nil {
-			node.Conn.Close()
-		}
-		if node.CurrentHub != nil {
-			node.CurrentHub.unregister <- node
-		}
-	})
+	heartbeatKick(node)
 
 	//5.完成发送逻辑
 	go sendProc(node)
@@ -132,8 +165,8 @@ func sendProc(node *Node) {
 }
 func recvProc(node *Node) {
 	defer func() {
-		// 节点断开时，无论是由于自行断开还是被时间轮踢出，彻底安全取消时间轮任务
-		utils.TW.RemoveTask(node.UserId)
+		// 节点断开时，无论是由于自行断开还是被时间轮踢出，彻底安全取消本设备的时间轮任务
+		utils.TW.RemoveTask(hbKey(node))
 
 		if node != nil && node.CurrentHub != nil {
 			node.CurrentHub.unregister <- node
@@ -159,21 +192,14 @@ func recvProc(node *Node) {
 
 		// 心跳
 		if msg.Type == 3 {
-			// 在线即续期登录会话（token 与用户会话集合一起滑动过期）
-			utils.TouchToken(node.Token, node.UserId)
-			// 将心跳延迟任务 O(1) 刷新到时间轮对应的未来槽位
-			delay := time.Duration(viper.GetInt("timeout.DelayHeartbeat")) * time.Second
-			if delay <= 0 {
-				delay = 60 * time.Second
+			// 在线即续期登录会话；会话已被撤销/过期则主动断开该端（多端隔离，B5）。
+			// dev 跳鉴权模式下不检查（压测连接本就无会话）。
+			if !viper.GetBool("auth.devSkipWSToken") && !utils.TouchToken(node.Token, node.UserId) {
+				fmt.Println("session revoked/expired, closing device node:", node.UserId, node.DeviceId)
+				break
 			}
-			utils.TW.AddTask(delay, node.UserId, func() {
-				if node.Conn != nil {
-					node.Conn.Close()
-				}
-				if node.CurrentHub != nil {
-					node.CurrentHub.unregister <- node
-				}
-			})
+			// 将心跳延迟任务 O(1) 刷新到时间轮对应的未来槽位（按设备隔离 + 代数守卫）
+			heartbeatKick(node)
 			continue
 		}
 

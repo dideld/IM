@@ -73,14 +73,20 @@ func ValidateToken(token string, userId int64) bool {
 	return int64(uid) == userId
 }
 
-// TouchToken 心跳续期：token 与用户会话集合一并滑动过期
-func TouchToken(token string, userId int64) {
+// TouchToken 心跳续期：token 与用户会话集合一并滑动过期。
+// 返回 false 表示 token 键已不存在（被撤销或过期）——调用方应断开该设备连接（B5：
+// 改密/踢线后旧 token 的存活 WS 不再骑在失效会话上）。Redis 瞬时错误返回 true（不误杀）。
+func TouchToken(token string, userId int64) bool {
 	if token == "" {
-		return
+		return false
 	}
 	ctx := context.Background()
-	Red.Expire(ctx, tokenKeyPrefix+token, tokenTTL())
+	alive, err := Red.Expire(ctx, tokenKeyPrefix+token, tokenTTL()).Result()
+	if err != nil {
+		return true
+	}
 	Red.Expire(ctx, userKeyPrefix+strconv.FormatInt(userId, 10), tokenTTL())
+	return alive
 }
 
 // DropUserSessions 踢线：删除该用户全部登录会话（改密等敏感更新时调用）

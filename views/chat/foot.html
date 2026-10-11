@@ -42,8 +42,8 @@
                 unread: {},   //会话未读数 {convId: count}，来源 /user/unreadList + Type=4 事件
                 convReadSeq: {},   //私聊对端已读游标 {convId: readSeq}，来源 /user/readStatus + Type=5 回执
                 pending: {},   //发送确认(ACK)状态机：clientMsgId → {msg, bubble, tries, timer}；断线重连 onopen 时整体重发
-                seenIds: {},   //接收端幂等：同 clientMsgId 的投递副本只渲染一次（落盘后置分发是 at-least-once）
-                seenCount: 0,
+                seenIds: {},   //接收端幂等：按 convId 分桶（同会话内同 clientMsgId 只渲染一次；全局计数清理会误杀跨会话副本）
+                reconnTries: 0, //非正常关闭自动重连计数（成功 onopen 清零，上限 10 次退避重连）
                 deviceId: (function () {
                     // sessionStorage 使每个浏览器标签页独立成"一台设备"，双开标签页即可联调多端在线
                     var d = sessionStorage.getItem("deviceId");
@@ -628,11 +628,20 @@
                         }
                         return
                     }
-                    //业务消息接收端幂等：落盘后置分发是 at-least-once，同 clientMsgId 只渲染一次
+                    //业务消息接收端幂等：落盘后置分发是 at-least-once，同会话同 clientMsgId 只渲染一次
                     if (data.clientMsgId) {
-                        if (this.seenIds[data.clientMsgId]) return
-                        this.seenIds[data.clientMsgId] = 1
-                        if (++this.seenCount > 500) { this.seenIds = {}; this.seenCount = 0 } //简单封顶清理
+                        var cid = (data.Type === 1 || data.Type === 2) ? this.convIdOf(data.Type, data.TargetId) : (this.currentConvId() || '_')
+                        var bucket = this.seenIds[cid]
+                        if (!bucket) { bucket = this.seenIds[cid] = { n: 0 } }
+                        if (bucket[data.clientMsgId]) return
+                        bucket[data.clientMsgId] = 1
+                        // 每会话封顶 200：按插入序淘汰最旧键（对象键序在 V8 下对字符串键稳定）
+                        if (++bucket.n > 200) {
+                            for (var k in bucket) {
+                                if (k !== 'n') { delete bucket[k]; break }
+                            }
+                            bucket.n--
+                        }
                     }
                     this.loaduserinfo(data.userId, function (user) {
 
@@ -658,25 +667,38 @@
                 initwebsocket: function () {
                     var url = "ws://" + location.host + "/chat?userId=" + userId() + "&token=" + util.parseQuery("token") + "&deviceId=" + this.deviceId;
                     this.webSocket = new WebSocket(url);
-                    //消息处理
+                    //消息处理：JSON 帧以 '{' 开头 + parse 成功双判据（indexOf("}") 会被含 '}' 的纯文本误判）
                     this.webSocket.onmessage = function (evt) {
-                        console.log("onmessage", evt.data)
-                        if (evt.data.indexOf("}") > -1) {
-                            console.log("recv json <==" + evt.data)
-                            this.onmessage(JSON.parse(evt.data));
+                        var s = evt.data
+                        if (typeof s === "string" && s.charAt(0) === '{') {
+                            try {
+                                this.onmessage(JSON.parse(s));
+                            } catch (e) {
+                                console.log("recv unparsable<==" + s)
+                            }
                         } else {
-                            console.log("recv<==" + evt.data)
+                            console.log("recv<==" + s)
                         }
                     }.bind(this)
-                    //打开成功：补偿断线/离线期间的未读变化 + pending 未确认消息全量重发
+                    //打开成功：补偿断线/离线期间的未读变化 + pending 未确认消息全量重发；重连计数清零
                     this.webSocket.onopen = function (evt) {
+                        this.reconnTries = 0
                         this.loadUnread()
                         this.flushPending()
                     }.bind(this)
-                    //关闭回调
+                    //关闭回调：非正常关闭（如被踢/网络断）自动退避重连，≤10 次；
+                    //服务端正常关闭(1000/1001)不重连。重连成功由 onopen 补 unread + pending。
                     this.webSocket.onclose = function (evt) {
-                        console.log("您已自动下线") //code 1006
-                    }
+                        console.log("连接关闭 code=" + (evt && evt.code))
+                        if (evt && (evt.code === 1000 || evt.code === 1001)) return
+                        if (this.reconnTries >= 10) {
+                            mui.toast("连接已断开且重连超限，请刷新页面重新登录")
+                            return
+                        }
+                        var that = this
+                        var backoff = Math.min(15000, 1000 * Math.pow(2, this.reconnTries++))
+                        setTimeout(function () { that.initwebsocket() }, backoff)
+                    }.bind(this)
                     //出错回调
                     this.webSocket.onerror = function (evt) {
                         console.log(evt.data)
