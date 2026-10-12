@@ -1,8 +1,8 @@
 package models
 
 import (
+	"context"
 	"webapp/utils"
-	"fmt"
 	"gorm.io/gorm"
 )
 
@@ -30,7 +30,7 @@ func CreateCommunity(community Community) (int,string){
 		return -1, "请先登录"
 	}
 	if err := utils.DB.Create(&community).Error; err != nil {
-		fmt.Println(err)
+		utils.Error(context.Background(), "CreateCommunity failed", "error", err)
 		tx.Rollback()
 		return -1, "建群失败"
 	}
@@ -63,12 +63,12 @@ func LoadCommunity(ownerId uint) ([]*Community, string) {
 		objIds = append(objIds, uint64(v.TargetId))
 	}
 
-	fmt.Println("objIds:", objIds)
+	utils.Debug(context.Background(), "LoadCommunity objIds", "objIds", objIds)
 
 	data := make([]*Community, 0)
 	utils.DB.Where("id in ?", objIds).Find(&data)
 	for _, v := range data {
-		fmt.Println(v)
+		utils.Debug(context.Background(), "LoadCommunity result", "community", v)
 	}
 	//utils.DB.Where()
 	return data, "查询成功"

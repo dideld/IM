@@ -1,114 +1,420 @@
+definitions:
+  utils.Response:
+    properties:
+      code:
+        type: integer
+      data: {}
+      message:
+        type: string
+      trace_id:
+        type: string
+    type: object
 info:
   contact: {}
 paths:
-  /index:
-    get:
+  /attach/upload:
+    post:
+      consumes:
+      - multipart/form-data
+      parameters:
+      - description: 上传的文件（jpg/png/gif/webp/bmp/mp3/wav/ogg/amr/m4a）
+        in: formData
+        name: file
+        required: true
+        type: file
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: 返回可访问的相对路径
+          schema:
+            allOf:
+            - $ref: '#/definitions/utils.Response'
+            - properties:
+                data:
+                  type: string
+              type: object
+        "400":
+          description: 参数错误或文件类型不允许
+          schema:
+            $ref: '#/definitions/utils.Response'
+      security:
+      - ApiKeyAuth: []
+      summary: 上传文件（图片/音频）
+      tags:
+      - 文件模块
+  /contact/addfriend:
+    post:
+      parameters:
+      - description: 目标用户ID
+        in: formData
+        name: targetId
+        required: true
+        type: integer
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
-      summary: 首页
+            $ref: '#/definitions/utils.Response'
+      security:
+      - X-Token: []
+      summary: 添加好友
       tags:
-      - 首页
-  /user/createUser:
+      - 好友模块
+  /contact/createCommunity:
     post:
       parameters:
-      - description: 用户名
-        in: query
+      - description: 群名称
+        in: formData
         name: name
+        required: true
         type: string
-      - description: 密码
-        in: query
-        name: password
+      - description: 群头像
+        in: formData
+        name: icon
         type: string
-      - description: 确认密码
-        in: query
-        name: repassword
+      - description: 群描述
+        in: formData
+        name: desc
         type: string
       produces:
       - application/json
       responses:
         "200":
-          description: code"，"message"} // 修改返回类型
+          description: OK
           schema:
-            type: string
-      summary: 新增用户
+            $ref: '#/definitions/utils.Response'
+      security:
+      - X-Token: []
+      summary: 创建群
+      tags:
+      - 群模块
+  /contact/deletefriend:
+    post:
+      parameters:
+      - description: 目标用户ID
+        in: formData
+        name: targetId
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/utils.Response'
+      security:
+      - X-Token: []
+      summary: 删除好友
+      tags:
+      - 好友模块
+  /contact/joinGroup:
+    post:
+      parameters:
+      - description: 群ID或群名称
+        in: formData
+        name: comId
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/utils.Response'
+      security:
+      - X-Token: []
+      summary: 加入群
+      tags:
+      - 群模块
+  /contact/loadCommunity:
+    post:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/utils.Response'
+      security:
+      - X-Token: []
+      summary: 获取群列表
+      tags:
+      - 群模块
+  /contact/loadfriends:
+    get:
+      parameters:
+      - description: 用户ID
+        in: query
+        name: userId
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/utils.Response'
+      summary: 加载好友列表
+      tags:
+      - 好友模块
+  /searchFriends:
+    post:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/utils.Response'
+      security:
+      - X-Token: []
+      summary: 获取好友列表
+      tags:
+      - 好友模块
+  /user/createUser:
+    post:
+      parameters:
+      - description: 用户名
+        in: formData
+        name: name
+        required: true
+        type: string
+      - description: 密码
+        in: formData
+        name: password
+        required: true
+        type: string
+      - description: 确认密码
+        in: formData
+        name: Identity
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/utils.Response'
+      summary: 注册新用户
       tags:
       - 用户模块
   /user/deleteUser:
     delete:
       parameters:
-      - description: id
+      - description: 用户ID
         in: query
         name: id
-        type: string
+        required: true
+        type: integer
       produces:
       - application/json
       responses:
         "200":
-          description: code"，"message"} // 修改返回类型
+          description: OK
           schema:
-            type: string
-      summary: 删除用户
+            $ref: '#/definitions/utils.Response'
+      security:
+      - X-Token: []
+      summary: 删除用户（仅能删除自己）
       tags:
       - 用户模块
-  /user/findUserByNameAndP:
+  /user/findUserByNameAndPwd:
     post:
       parameters:
       - description: 用户名
         in: formData
         name: name
+        required: true
         type: string
       - description: 密码
         in: formData
         name: password
+        required: true
         type: string
       produces:
       - application/json
       responses:
         "200":
-          description: code"，"message"} // 修改返回类型
+          description: OK
           schema:
-            type: string
-      summary: 登录
+            $ref: '#/definitions/utils.Response'
+      summary: 用户登录
       tags:
       - 用户模块
   /user/getUserList:
-    get:
+    post:
       produces:
       - application/json
       responses:
         "200":
-          description: code"，"message"} // 修改返回类型
+          description: OK
           schema:
-            type: string
-      summary: 所有用户
+            $ref: '#/definitions/utils.Response'
+      security:
+      - X-Token: []
+      summary: 获取所有用户列表
       tags:
       - 用户模块
-  /user/updateUser:
-    put:
+  /user/historyMsg:
+    post:
       parameters:
-      - description: id
+      - description: 会话ID
+        in: formData
+        name: convId
+        type: string
+      - description: 私聊用户A的ID（无convId时使用）
+        in: formData
+        name: userIdA
+        type: integer
+      - description: 私聊用户B的ID（无convId时使用）
+        in: formData
+        name: userIdB
+        type: integer
+      - description: 游标：只取 seq 小于该值的消息，0=从最新开始
+        in: formData
+        name: beforeSeq
+        type: integer
+      - description: 条数，默认20，最大100
+        in: formData
+        name: size
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/utils.Response'
+      security:
+      - X-Token: []
+      summary: 读取冷层历史消息（MySQL，游标分页）
+      tags:
+      - 消息模块
+  /user/markRead:
+    post:
+      parameters:
+      - description: 会话ID
+        in: formData
+        name: convId
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/utils.Response'
+      security:
+      - X-Token: []
+      summary: 标记会话已读（清未读并记录seq游标，群聊同时广播已读回执）
+      tags:
+      - 消息模块
+  /user/readStatus:
+    post:
+      parameters:
+      - description: 会话ID
+        in: formData
+        name: convId
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/utils.Response'
+      security:
+      - X-Token: []
+      summary: 查询会话对端已读游标（私聊气泡"已读"状态）
+      tags:
+      - 消息模块
+  /user/redisMsg:
+    post:
+      parameters:
+      - description: 会话ID（私聊 p_{小}_{大}，群聊 g_{群id}）
+        in: formData
+        name: convId
+        type: string
+      - description: 私聊用户A的ID（无convId时使用）
+        in: formData
+        name: userIdA
+        type: integer
+      - description: 私聊用户B的ID（无convId时使用）
+        in: formData
+        name: userIdB
+        type: integer
+      - description: 起始位置
+        in: formData
+        name: start
+        type: integer
+      - description: 结束位置
+        in: formData
+        name: end
+        type: integer
+      - description: 是否倒序
+        in: formData
+        name: isRev
+        type: boolean
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/utils.Response'
+      security:
+      - X-Token: []
+      summary: 读取热层消息（Redis缓存）
+      tags:
+      - 消息模块
+  /user/unreadList:
+    post:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/utils.Response'
+      security:
+      - X-Token: []
+      summary: 获取全部会话未读数
+      tags:
+      - 消息模块
+  /user/updateUser:
+    post:
+      parameters:
+      - description: 用户ID
         in: formData
         name: id
-        type: string
-      - description: name
+        required: true
+        type: integer
+      - description: 用户名
         in: formData
         name: name
         type: string
-      - description: password
+      - description: 新密码
         in: formData
         name: password
         type: string
-      - description: phone
+      - description: 手机号
         in: formData
         name: phone
         type: string
-      - description: email
+      - description: 头像URL
+        in: formData
+        name: icon
+        type: string
+      - description: 邮箱
         in: formData
         name: email
         type: string
@@ -116,10 +422,12 @@ paths:
       - application/json
       responses:
         "200":
-          description: code"，"message"} // 修改返回类型
+          description: OK
           schema:
-            type: string
-      summary: 修改用户
+            $ref: '#/definitions/utils.Response'
+      security:
+      - X-Token: []
+      summary: 修改用户资料
       tags:
       - 用户模块
 swagger: "2.0"

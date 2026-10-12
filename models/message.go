@@ -119,7 +119,7 @@ func Chat(writer http.ResponseWriter,request *http.Request){
 		},
 	}).Upgrade(writer,request,nil)
 	if err!=nil{
-		fmt.Println(err)
+		utils.Error(context.Background(), "WebSocket upgrade failed", "error", err)
 		return
 	}
 	//2.获取conn
@@ -186,7 +186,7 @@ func recvProc(node *Node) {
 		msg := Message{}
 		err = json.Unmarshal(data, &msg)
 		if err != nil {
-			fmt.Println(err)
+			utils.Error(context.Background(), "recvProc json.Unmarshal failed", "error", err)
 			continue
 		}
 
@@ -195,7 +195,7 @@ func recvProc(node *Node) {
 			// 在线即续期登录会话；会话已被撤销/过期则主动断开该端（多端隔离，B5）。
 			// dev 跳鉴权模式下不检查（压测连接本就无会话）。
 			if !viper.GetBool("auth.devSkipWSToken") && !utils.TouchToken(node.Token, node.UserId) {
-				fmt.Println("session revoked/expired, closing device node:", node.UserId, node.DeviceId)
+				utils.Warn(context.Background(), "session revoked/expired, closing device node", "userId", node.UserId, "deviceId", node.DeviceId)
 				break
 			}
 			// 将心跳延迟任务 O(1) 刷新到时间轮对应的未来槽位（按设备隔离 + 代数守卫）
@@ -231,14 +231,14 @@ func udpRevProc(){
 
 	})
 	if err!=nil{
-		fmt.Println(err)
+		utils.Error(context.Background(), "udpRevProc ListenUDP failed", "error", err)
 	}
 	defer con.Close()
 	for {
 		var buf [512]byte
 		n, err := con.Read(buf[0:])
 		if err != nil {
-			fmt.Println(err)
+			utils.Error(context.Background(), "udpRevProc read failed", "error", err)
 			return
 		}
 
@@ -262,7 +262,7 @@ func dispatch(data []byte){
 func dispatchTo(data []byte, ackUid int64) {
 	msg := Message{}
 	if err := json.Unmarshal(data, &msg); err != nil {
-		fmt.Println(err)
+		utils.Error(context.Background(), "dispatchTo json.Unmarshal failed", "error", err)
 		return
 	}
 	switch msg.Type {
@@ -344,7 +344,7 @@ func RedisMsg(convId string, start int64, end int64, isRev bool) []string {
 		rels, err = utils.Red.ZRange(ctx, convId, start, end).Result()
 	}
 	if err != nil {
-		fmt.Println(err) //没有找到
+		utils.Error(ctx, "Redis_Msg query failed", "error", err)
 	}
 	return rels
 }

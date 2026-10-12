@@ -4,21 +4,275 @@
         "contact": {}
     },
     "paths": {
-        "/index": {
+        "/attach/upload": {
+            "post": {
+                "security": [
+                    {
+                        "ApiKeyAuth": []
+                    }
+                ],
+                "consumes": [
+                    "multipart/form-data"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "文件模块"
+                ],
+                "summary": "上传文件（图片/音频）",
+                "parameters": [
+                    {
+                        "type": "file",
+                        "description": "上传的文件（jpg/png/gif/webp/bmp/mp3/wav/ogg/amr/m4a）",
+                        "name": "file",
+                        "in": "formData",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "返回可访问的相对路径",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/utils.Response"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "type": "string"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "400": {
+                        "description": "参数错误或文件类型不允许",
+                        "schema": {
+                            "$ref": "#/definitions/utils.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/contact/addfriend": {
+            "post": {
+                "security": [
+                    {
+                        "X-Token": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "好友模块"
+                ],
+                "summary": "添加好友",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "目标用户ID",
+                        "name": "targetId",
+                        "in": "formData",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/utils.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/contact/createCommunity": {
+            "post": {
+                "security": [
+                    {
+                        "X-Token": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "群模块"
+                ],
+                "summary": "创建群",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "群名称",
+                        "name": "name",
+                        "in": "formData",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "群头像",
+                        "name": "icon",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "群描述",
+                        "name": "desc",
+                        "in": "formData"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/utils.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/contact/deletefriend": {
+            "post": {
+                "security": [
+                    {
+                        "X-Token": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "好友模块"
+                ],
+                "summary": "删除好友",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "目标用户ID",
+                        "name": "targetId",
+                        "in": "formData",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/utils.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/contact/joinGroup": {
+            "post": {
+                "security": [
+                    {
+                        "X-Token": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "群模块"
+                ],
+                "summary": "加入群",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "群ID或群名称",
+                        "name": "comId",
+                        "in": "formData",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/utils.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/contact/loadCommunity": {
+            "post": {
+                "security": [
+                    {
+                        "X-Token": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "群模块"
+                ],
+                "summary": "获取群列表",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/utils.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/contact/loadfriends": {
             "get": {
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
-                    "首页"
+                    "好友模块"
                 ],
-                "summary": "首页",
+                "summary": "加载好友列表",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "用户ID",
+                        "name": "userId",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "type": "object",
-                            "additionalProperties": true
+                            "$ref": "#/definitions/utils.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/searchFriends": {
+            "post": {
+                "security": [
+                    {
+                        "X-Token": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "好友模块"
+                ],
+                "summary": "获取好友列表",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/utils.Response"
                         }
                     }
                 }
@@ -32,32 +286,35 @@
                 "tags": [
                     "用户模块"
                 ],
-                "summary": "新增用户",
+                "summary": "注册新用户",
                 "parameters": [
                     {
                         "type": "string",
                         "description": "用户名",
                         "name": "name",
-                        "in": "query"
+                        "in": "formData",
+                        "required": true
                     },
                     {
                         "type": "string",
                         "description": "密码",
                         "name": "password",
-                        "in": "query"
+                        "in": "formData",
+                        "required": true
                     },
                     {
                         "type": "string",
                         "description": "确认密码",
-                        "name": "repassword",
-                        "in": "query"
+                        "name": "Identity",
+                        "in": "formData",
+                        "required": true
                     }
                 ],
                 "responses": {
                     "200": {
-                        "description": "code\"，\"message\"} // 修改返回类型",
+                        "description": "OK",
                         "schema": {
-                            "type": "string"
+                            "$ref": "#/definitions/utils.Response"
                         }
                     }
                 }
@@ -65,32 +322,38 @@
         },
         "/user/deleteUser": {
             "delete": {
+                "security": [
+                    {
+                        "X-Token": []
+                    }
+                ],
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
                     "用户模块"
                 ],
-                "summary": "删除用户",
+                "summary": "删除用户（仅能删除自己）",
                 "parameters": [
                     {
-                        "type": "string",
-                        "description": "id",
+                        "type": "integer",
+                        "description": "用户ID",
                         "name": "id",
-                        "in": "query"
+                        "in": "query",
+                        "required": true
                     }
                 ],
                 "responses": {
                     "200": {
-                        "description": "code\"，\"message\"} // 修改返回类型",
+                        "description": "OK",
                         "schema": {
-                            "type": "string"
+                            "$ref": "#/definitions/utils.Response"
                         }
                     }
                 }
             }
         },
-        "/user/findUserByNameAndP": {
+        "/user/findUserByNameAndPwd": {
             "post": {
                 "produces": [
                     "application/json"
@@ -98,8 +361,287 @@
                 "tags": [
                     "用户模块"
                 ],
-                "summary": "登录",
+                "summary": "用户登录",
                 "parameters": [
+                    {
+                        "type": "string",
+                        "description": "用户名",
+                        "name": "name",
+                        "in": "formData",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "密码",
+                        "name": "password",
+                        "in": "formData",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/utils.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/user/getUserList": {
+            "post": {
+                "security": [
+                    {
+                        "X-Token": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "用户模块"
+                ],
+                "summary": "获取所有用户列表",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/utils.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/user/historyMsg": {
+            "post": {
+                "security": [
+                    {
+                        "X-Token": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "消息模块"
+                ],
+                "summary": "读取冷层历史消息（MySQL，游标分页）",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "会话ID",
+                        "name": "convId",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "私聊用户A的ID（无convId时使用）",
+                        "name": "userIdA",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "私聊用户B的ID（无convId时使用）",
+                        "name": "userIdB",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "游标：只取 seq 小于该值的消息，0=从最新开始",
+                        "name": "beforeSeq",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "条数，默认20，最大100",
+                        "name": "size",
+                        "in": "formData"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/utils.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/user/markRead": {
+            "post": {
+                "security": [
+                    {
+                        "X-Token": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "消息模块"
+                ],
+                "summary": "标记会话已读（清未读并记录seq游标，群聊同时广播已读回执）",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "会话ID",
+                        "name": "convId",
+                        "in": "formData",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/utils.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/user/readStatus": {
+            "post": {
+                "security": [
+                    {
+                        "X-Token": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "消息模块"
+                ],
+                "summary": "查询会话对端已读游标（私聊气泡\"已读\"状态）",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "会话ID",
+                        "name": "convId",
+                        "in": "formData",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/utils.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/user/redisMsg": {
+            "post": {
+                "security": [
+                    {
+                        "X-Token": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "消息模块"
+                ],
+                "summary": "读取热层消息（Redis缓存）",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "会话ID（私聊 p_{小}_{大}，群聊 g_{群id}）",
+                        "name": "convId",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "私聊用户A的ID（无convId时使用）",
+                        "name": "userIdA",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "私聊用户B的ID（无convId时使用）",
+                        "name": "userIdB",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "起始位置",
+                        "name": "start",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "结束位置",
+                        "name": "end",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "boolean",
+                        "description": "是否倒序",
+                        "name": "isRev",
+                        "in": "formData"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/utils.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/user/unreadList": {
+            "post": {
+                "security": [
+                    {
+                        "X-Token": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "消息模块"
+                ],
+                "summary": "获取全部会话未读数",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/utils.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/user/updateUser": {
+            "post": {
+                "security": [
+                    {
+                        "X-Token": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "用户模块"
+                ],
+                "summary": "修改用户资料",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "用户ID",
+                        "name": "id",
+                        "in": "formData",
+                        "required": true
+                    },
                     {
                         "type": "string",
                         "description": "用户名",
@@ -108,88 +650,53 @@
                     },
                     {
                         "type": "string",
-                        "description": "密码",
-                        "name": "password",
-                        "in": "formData"
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "code\"，\"message\"} // 修改返回类型",
-                        "schema": {
-                            "type": "string"
-                        }
-                    }
-                }
-            }
-        },
-        "/user/getUserList": {
-            "get": {
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "用户模块"
-                ],
-                "summary": "所有用户",
-                "responses": {
-                    "200": {
-                        "description": "code\"，\"message\"} // 修改返回类型",
-                        "schema": {
-                            "type": "string"
-                        }
-                    }
-                }
-            }
-        },
-        "/user/updateUser": {
-            "put": {
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "用户模块"
-                ],
-                "summary": "修改用户",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "id",
-                        "name": "id",
-                        "in": "formData"
-                    },
-                    {
-                        "type": "string",
-                        "description": "name",
-                        "name": "name",
-                        "in": "formData"
-                    },
-                    {
-                        "type": "string",
-                        "description": "password",
+                        "description": "新密码",
                         "name": "password",
                         "in": "formData"
                     },
                     {
                         "type": "string",
-                        "description": "phone",
+                        "description": "手机号",
                         "name": "phone",
                         "in": "formData"
                     },
                     {
                         "type": "string",
-                        "description": "email",
+                        "description": "头像URL",
+                        "name": "icon",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "邮箱",
                         "name": "email",
                         "in": "formData"
                     }
                 ],
                 "responses": {
                     "200": {
-                        "description": "code\"，\"message\"} // 修改返回类型",
+                        "description": "OK",
                         "schema": {
-                            "type": "string"
+                            "$ref": "#/definitions/utils.Response"
                         }
                     }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "utils.Response": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "integer"
+                },
+                "data": {},
+                "message": {
+                    "type": "string"
+                },
+                "trace_id": {
+                    "type": "string"
                 }
             }
         }

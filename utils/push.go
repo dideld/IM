@@ -7,7 +7,7 @@ package utils
 //   配置：push.enabled=true 且已注册适配器时才会真正触发。
 
 import (
-	"fmt"
+	"context"
 
 	"github.com/spf13/viper"
 )
@@ -36,11 +36,11 @@ func RegisterPush(a PushAdapter) { pushAdapter = a }
 func OfflinePush(uid int64, s PushSummary) {
 	if !viper.GetBool("push.enabled") || pushAdapter == nil {
 		if viper.GetBool("push.debug") {
-			fmt.Printf("[push-stub] offline uid=%d conv=%s seq=%d\n", uid, s.ConvId, s.Seq)
+			Info(context.Background(), "[push-stub] offline", "uid", uid, "conv", s.ConvId, "seq", s.Seq)
 		}
 		return
 	}
 	if err := pushAdapter.OfflinePush(uid, s); err != nil {
-		fmt.Printf("OfflinePush failed uid=%d conv=%s: %v\n", uid, s.ConvId, err)
+		Error(context.Background(), "OfflinePush failed", "uid", uid, "conv", s.ConvId, "error", err)
 	}
 }

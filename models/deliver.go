@@ -8,7 +8,6 @@ package models
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -81,7 +80,7 @@ func failLanded(rec landedRecord, reason string) {
 	// 按 member 精确删除（raw 即热层写入时的 member），再按 score 兜底一次
 	ctx := context.Background()
 	if err := utils.Red.ZRem(ctx, rec.convId, string(rec.raw)).Err(); err != nil {
-		fmt.Println("failLanded ZRem(member) failed:", err)
+		utils.Error(ctx, "failLanded ZRem(member) failed", "error", err)
 	}
 	utils.Red.ZRemRangeByScore(ctx, rec.convId,
 		strconv.FormatFloat(float64(rec.seq), 'f', -1, 64),
@@ -105,7 +104,7 @@ func dlqHold(rec landedRecord, reason string) {
 	}
 	ctx := context.Background()
 	if err := utils.Red.RPush(ctx, "msg:dlq", item).Err(); err != nil {
-		fmt.Println("dlq push failed:", err)
+		utils.Error(ctx, "dlq push failed", "error", err)
 	}
 	utils.Red.LTrim(ctx, "msg:dlq", -500, -1)
 }
@@ -133,7 +132,7 @@ func produceOrDefer(senderUid int64, m *Message, data []byte) {
 	if err := utils.Produce(data); err == nil {
 		return
 	} else {
-		fmt.Println("Kafka 生产失败，进入应用层重投队列:", err)
+		utils.Error(context.Background(), "Kafka 生产失败，进入应用层重投队列", "error", err)
 	}
 	ppMu.Lock()
 	if len(ppQueue) >= 10000 { // 队列上限：服务长时间不可用时快速失败而不是无限吃内存
@@ -178,7 +177,7 @@ func startProducePump() {
 			ppMu.Unlock()
 			for _, p := range dead {
 				ackTo(p.senderUid, p.clientMsgId, p.convId, 0, 0, -1, "消息服务不可用(重投超限)")
-				fmt.Println("【告警】Kafka 重投超限，已回失败 ACK:", p.clientMsgId)
+				utils.Warn(context.Background(), "Kafka 重投超限，已回失败 ACK", "clientMsgId", p.clientMsgId)
 			}
 		}
 	}()
@@ -228,7 +227,7 @@ func GroupMembers(gid uint) []int64 {
 			pipe.Expire(ctx, key, gmTTL)
 		}
 		if _, e := pipe.Exec(ctx); e != nil {
-			fmt.Println("g_members cache refill failed:", e)
+			utils.Error(ctx, "g_members cache refill failed", "error", e)
 		}
 		out := make([]int64, 0, len(members))
 		for _, m := range members {
@@ -266,7 +265,7 @@ func CacheGroupMember(gid, uid uint) {
 	pipe.SAdd(ctx, key, int64(uid))
 	pipe.Expire(ctx, key, gmTTL)
 	if _, err := pipe.Exec(ctx); err != nil {
-		fmt.Println("CacheGroupMember failed:", err)
+		utils.Error(ctx, "CacheGroupMember failed", "error", err)
 	}
 }
 

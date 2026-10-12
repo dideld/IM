@@ -38,7 +38,7 @@ func GetUserList() []*UserBasic{
 	var data []*UserBasic
 	utils.DB.Find(&data)
 	for _,v:=range data{
-		fmt.Println(v)
+		utils.Debug(context.Background(), "GetUserList result", "user", v)
 	}
 	return data
 }

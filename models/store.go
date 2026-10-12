@@ -107,13 +107,13 @@ func coldModeVal() string {
 func persistMessage(msgData []byte) error {
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Println("persistMessage panic (按失败提交，原文已尽力死信):", r)
+			utils.Error(context.Background(), "persistMessage panic (按失败提交，原文已尽力死信)", "recover", r)
 		}
 	}()
 	jsonMsg := Message{}
 	// 非 JSON（系统提示语等误入链路）直接跳过，防止污染会话 key（历史上 msg_0_0 就是这么来的）
 	if err := json.Unmarshal(msgData, &jsonMsg); err != nil {
-		fmt.Println("persistMessage skip invalid payload:", err)
+		utils.Warn(context.Background(), "persistMessage skip invalid payload", "error", err)
 		return nil
 	}
 	if jsonMsg.Type != 1 && jsonMsg.Type != 2 {
@@ -160,7 +160,7 @@ func persistMessage(msgData []byte) error {
 	// ---- 发 seq（会话级严格递增；瞬时故障走 Kafka 重投）----
 	seq, err := redIncrRetry(ctx, seqKeyPrefix+convId)
 	if err != nil {
-		fmt.Println("seq INCR failed(重投):", convId, err)
+		utils.Error(ctx, "seq INCR failed(重投)", "convId", convId, "error", err)
 		return err
 	}
 	rec.seq = seq
@@ -178,7 +178,7 @@ func persistMessage(msgData []byte) error {
 		pipe.Expire(ctx, ck, ttl)
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
-		fmt.Println("Redis hot persist Error(重投):", err)
+		utils.Error(ctx, "Redis hot persist Error(重投)", "error", err)
 		return err
 	}
 	if rec.clientMsgId != "" {
@@ -214,8 +214,8 @@ func enqueueCold(rec landedRecord) error {
 		case coldCh <- rec:
 			return nil
 		case <-stallTicker.C:
-			fmt.Printf("【警告】冷管道停摆：coldCh %d/%d 满，Kafka 消费者暂停(offset 未提交靠重放)，检查 MySQL！\n",
-				len(coldCh), cap(coldCh))
+			utils.Warn(context.Background(), "冷管道停摆：coldCh 满，Kafka 消费者暂停(offset 未提交靠重放)，检查 MySQL！",
+				"queue_len", len(coldCh), "queue_cap", cap(coldCh))
 		}
 		if utils.KafkaStopping() {
 			// 停机中放弃入队：清去重占位让重放走全新落库，返回 error 使 offset 不提交
@@ -271,7 +271,7 @@ func pushUnread(rec *landedRecord, uids []int64) {
 		uk := unreadKeyPrefix + strconv.FormatInt(uid, 10)
 		n, err := utils.Red.HIncrBy(ctx, uk, rec.convId, 1).Result()
 		if err != nil {
-			fmt.Println("unread HIncrBy error:", uk, err)
+			utils.Error(ctx, "unread HIncrBy error", "key", uk, "error", err)
 			continue
 		}
 		evt, err := json.Marshal(map[string]interface{}{"Type": 4, "ConvId": rec.convId, "Seq": rec.seq, "Unread": n})
@@ -378,7 +378,7 @@ func MarkRead(userId int64, convId string) {
 		pipe.Set(ctx, readKeyPrefix+strconv.FormatInt(userId, 10)+":"+convId, max, 0)
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
-		fmt.Println("MarkRead error:", err)
+		utils.Error(ctx, "MarkRead error", "error", err)
 	}
 	if max == "" {
 		return // 该会话还没有消息，无游标可存
@@ -392,14 +392,14 @@ func MarkRead(userId int64, convId string) {
 			DoUpdates: clause.Assignments(map[string]interface{}{"last_seq": seq, "updated_at": time.Now()}),
 		}).Create(&ReadCursor{UserId: uint(userId), ConvKey: convId, LastSeq: seq}).Error
 		if err != nil {
-			fmt.Println("read cursor upsert failed:", err)
+			utils.Error(ctx, "read cursor upsert failed", "error", err)
 		}
 		// 私聊：把游标之前、对方发给我的消息回填 read_time
 		res := utils.DB.Model(&Message{}).
 			Where("conv_key = ? AND seq > 0 AND seq <= ? AND user_id <> ? AND read_time = 0", convId, seq, userId).
 			Update("read_time", time.Now().UnixMilli())
 		if res.Error != nil {
-			fmt.Println("read_time backfill failed:", res.Error)
+			utils.Error(ctx, "read_time backfill failed", "error", res.Error)
 		}
 		// 对端在线则推已读回执事件（多端扇出自动覆盖其所有设备）
 		if peer := convPeer(convId, userId); peer > 0 {
@@ -464,7 +464,7 @@ func markReadWindowTx(userId int64, convId string, seq int64) int64 {
 			UpdateColumns(map[string]interface{}{"last_seq": seq, "updated_at": time.Now()}).Error
 	})
 	if err != nil {
-		fmt.Println("markReadWindowTx failed:", err)
+		utils.Error(context.Background(), "markReadWindowTx failed", "error", err)
 	}
 	return old
 }
@@ -484,7 +484,7 @@ func UnreadMap(userId int64) map[string]int64 {
 	out := map[string]int64{}
 	m, err := utils.Red.HGetAll(context.Background(), unreadKeyPrefix+strconv.FormatInt(userId, 10)).Result()
 	if err != nil {
-		fmt.Println("UnreadMap error:", err)
+		utils.Error(context.Background(), "UnreadMap error", "error", err)
 		return out
 	}
 	for k, v := range m {
@@ -552,7 +552,7 @@ func StartColdWriter() {
 						}
 					default:
 						flushBatch()
-						fmt.Println("cold writer stopped, final flush+deliver done")
+						utils.Info(context.Background(), "cold writer stopped, final flush+deliver done")
 						close(coldDone)
 						return
 					}
@@ -560,7 +560,7 @@ func StartColdWriter() {
 			}
 		}
 	}()
-	fmt.Println("cold writer started, mode:", coldModeVal(), "batchSize:", batchSize, "flushInterval:", flush)
+	utils.Info(context.Background(), "cold writer started", "mode", coldModeVal(), "batchSize", batchSize, "flushInterval", flush.String())
 }
 
 // coldInsertRetry 冷层写入（batch/inline 共用）：3 次尝试，主键/唯一冲突跳过（DoNothing）。
@@ -579,13 +579,13 @@ func coldInsertRetry(batch []landedRecord) error {
 		if err == nil {
 			if r.RowsAffected < int64(len(msgs)) {
 				// 冲突跳过的行要大声告警：workerId 撞号（不同消息同 ID）与 Redis 丢失后的重放（同 clientMsgId）都会到这里
-				fmt.Printf("【警告】冷存储 %d/%d 条唯一冲突被跳过：排查多实例 snowflake.workerId 重复，或 Redis 丢失后 Kafka 重放（由 uk_conv_cmid 拦截）\n",
-					int64(len(msgs))-r.RowsAffected, len(msgs))
+				utils.Warn(context.Background(), "冷存储唯一冲突被跳过：排查多实例 snowflake.workerId 重复，或 Redis 丢失后 Kafka 重放（由 uk_conv_cmid 拦截）",
+					"conflict_count", int64(len(msgs))-r.RowsAffected, "batch_size", len(msgs))
 			}
 			return nil
 		}
 	}
-	fmt.Println("cold persist MySQL batch failed, size:", len(batch), "err:", err)
+	utils.Error(context.Background(), "cold persist MySQL batch failed", "size", len(batch), "error", err)
 	return err
 }
 
@@ -598,7 +598,7 @@ func StopColdWriter() {
 	select {
 	case <-coldDone:
 	case <-time.After(10 * time.Second):
-		fmt.Println("【警告】cold writer 收尾超时，可能有在途消息未落库/未投递")
+		utils.Warn(context.Background(), "cold writer 收尾超时，可能有在途消息未落库/未投递")
 	}
 }
 

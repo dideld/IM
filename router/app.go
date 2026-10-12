@@ -1,16 +1,20 @@
 package router
 
 import (
+	"webapp/middleware"
 	"webapp/service"
 
 	"github.com/gin-contrib/pprof"
+	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 	docs "webapp/docs"
-	"github.com/gin-gonic/gin"
 )
-func Router() *gin.Engine{
-	r := gin.Default()
+
+func Router() *gin.Engine {
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(middleware.TraceID())
 	pprof.Register(r)
 	docs.SwaggerInfo.BasePath="/"
 	//swagger

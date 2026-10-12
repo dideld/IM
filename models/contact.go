@@ -1,9 +1,9 @@
 package models
 
 import (
+	"context"
 	"webapp/utils"
 	"gorm.io/gorm"
-	"fmt"
 )
 
 //人员关系
@@ -24,7 +24,7 @@ func SearchFriend(userId uint) []UserBasic{
 	objIds:=make([]uint64,0)
 	utils.DB.Where("owner_id= ? and type=1",userId).Find(&contacts)
 	for _,v:=range contacts{
-		fmt.Println(">>>>>>>>>>>>",v)
+		utils.Debug(context.Background(), "SearchFriend contact", "contact", v)
 		objIds=append(objIds,uint64(v.TargetId))
 	}
 	users:=make([]UserBasic,0)
@@ -91,11 +91,11 @@ func DeleteFriend(ownerId uint,targetId uint) (int,string){
 	}
 	contact0:=Contact{}
 	if err:=utils.DB.Where("owner_id= ? and target_id = ? and type = 1",ownerId,targetId).Delete(&contact0).Error;err!=nil{
-		fmt.Println(err)
+		utils.Error(context.Background(), "DeleteFriend failed", "ownerId", ownerId, "targetId", targetId, "error", err)
 		return -1,""
 	}
 	if err:=utils.DB.Where("owner_id= ? and target_id = ? and type = 1",targetId,ownerId).Delete(&contact0).Error;err!=nil{
-		fmt.Println(err)
+		utils.Error(context.Background(), "DeleteFriend reverse failed", "ownerId", ownerId, "targetId", targetId, "error", err)
 		return -1,""
 	}
 

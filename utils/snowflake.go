@@ -1,8 +1,8 @@
 package utils
 
 import (
+	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 )
@@ -55,13 +55,13 @@ func GenSnowflakeId() int64 {
 	if now < sfWorker.timestamp {
 		offset := sfWorker.timestamp - now
 		if offset <= 2000 {
-			fmt.Printf("【告警】时钟回拨 %dms，有界等待追平\n", offset)
+			Warn(context.Background(), "时钟回拨，有界等待追平", "offset_ms", offset)
 			for now < sfWorker.timestamp {
 				time.Sleep(time.Duration(sfWorker.timestamp-now) * time.Millisecond)
 				now = time.Now().UnixNano() / 1e6
 			}
 		} else {
-			fmt.Printf("【告警】时钟大幅回拨 %dms，借时间戳维持 ID 单调\n", offset)
+			Warn(context.Background(), "时钟大幅回拨，借时间戳维持 ID 单调", "offset_ms", offset)
 			now = sfWorker.timestamp
 			sfWorker.number++
 			if sfWorker.number > numberMax {

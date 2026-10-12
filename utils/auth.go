@@ -10,7 +10,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"strconv"
 	"time"
 
@@ -44,7 +43,7 @@ func IssueToken(userId uint) string {
 	pipe.SAdd(ctx, uk, token)
 	pipe.Expire(ctx, uk, tokenTTL())
 	if _, err := pipe.Exec(ctx); err != nil {
-		fmt.Println("IssueToken redis error:", err)
+		Error(ctx, "IssueToken redis error", "error", err)
 	}
 	return token
 }
@@ -95,7 +94,7 @@ func DropUserSessions(userId uint) {
 	uk := userKeyPrefix + strconv.FormatUint(uint64(userId), 10)
 	tokens, err := Red.SMembers(ctx, uk).Result()
 	if err != nil {
-		fmt.Println("DropUserSessions error:", err)
+		Error(ctx, "DropUserSessions error", "error", err)
 		return
 	}
 	keys := make([]string, 0, len(tokens)+1)
@@ -105,7 +104,7 @@ func DropUserSessions(userId uint) {
 	}
 	if len(keys) > 1 {
 		if err := Red.Del(ctx, keys...).Err(); err != nil {
-			fmt.Println("DropUserSessions del error:", err)
+			Error(ctx, "DropUserSessions del error", "error", err)
 		}
 	}
 }

@@ -9,12 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// GetIndex
-// @Tags 首页
-// @Summary 首页
-// @Produce json
-// @Success 200 {object} map[string]interface{}  // 修改返回类型
-// @Router /index [get]
+// GetIndex 首页（HTML 页面，非 API）
 func GetIndex(c *gin.Context) {
     // ind,err:=template.ParseFiles("index.html")
     // if err!=nil{

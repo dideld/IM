@@ -1,10 +1,10 @@
 package utils
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"strings"
-	"fmt"
 )
 //小写
 func Md5Encode(password string)string{
@@ -25,6 +25,6 @@ func MakePassword(plainpwd,salt string) string{
 //解密
 func ValidPassword(plainpwd, salt string, password string) bool {
 	md := Md5Encode(plainpwd + salt)
-	fmt.Println(md + "				" + password)
+	Info(context.Background(), "ValidPassword comparison", "hash", md, "match", md == password)
 	return md == password
 }

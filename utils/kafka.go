@@ -38,19 +38,19 @@ func kafkaConf(key, def string) string {
 func ensureTopic(broker, topic string) {
 	conn, err := kafka.Dial("tcp", broker)
 	if err != nil {
-		fmt.Println("Kafka ensureTopic 连接失败(非致命，broker 未就绪时消费端仍会重试):", err)
+		Warn(context.Background(), "Kafka ensureTopic 连接失败(非致命，broker 未就绪时消费端仍会重试)", "error", err)
 		return
 	}
 	defer conn.Close()
 
 	c, err := conn.Controller()
 	if err != nil {
-		fmt.Println("Kafka ensureTopic 取 controller 失败:", err)
+		Warn(context.Background(), "Kafka ensureTopic 取 controller 失败", "error", err)
 		return
 	}
 	cc, err := kafka.Dial("tcp", net.JoinHostPort(c.Host, strconv.Itoa(c.Port)))
 	if err != nil {
-		fmt.Println("Kafka ensureTopic 连接 controller 失败:", err)
+		Warn(context.Background(), "Kafka ensureTopic 连接 controller 失败", "error", err)
 		return
 	}
 	defer cc.Close()
@@ -60,10 +60,10 @@ func ensureTopic(broker, topic string) {
 		NumPartitions:     1,
 		ReplicationFactor: 1,
 	}); err != nil && !strings.Contains(err.Error(), "already exists") {
-		fmt.Println("Kafka ensureTopic 创建 topic 失败:", err)
+		Error(context.Background(), "Kafka ensureTopic 创建 topic 失败", "error", err)
 		return
 	}
-	fmt.Println("Kafka topic ensured:", topic)
+	Info(context.Background(), "Kafka topic ensured", "topic", topic)
 }
 
 // InitKafka 初始化 Kafka 生产者（同步模式）
@@ -83,7 +83,7 @@ func InitKafka() {
 		MaxAttempts:  3,
 		WriteTimeout: 5 * time.Second,
 	}
-	fmt.Println("Kafka Producer (sync writer) Initialized, broker:", broker, "topic:", topic)
+	Info(context.Background(), "Kafka Producer (sync writer) Initialized", "broker", broker, "topic", topic)
 }
 
 // Produce 同步投递一条消息到 chat_messages。
@@ -102,7 +102,7 @@ func Produce(msgData []byte) error {
 // SendMsgToKafka 兼容旧调用点的薄封装（忽略错误=仅限"无需回执"的旁路流量使用）
 func SendMsgToKafka(msgData []byte) {
 	if err := Produce(msgData); err != nil {
-		fmt.Println("【严重警告】Kafka 投递失败:", err)
+		Fatal(context.Background(), "Kafka 投递失败", "error", err)
 	}
 }
 
@@ -123,7 +123,7 @@ func StartKafkaConsumer(consumeHandler func([]byte) error) {
 		MaxWait:  10 * time.Millisecond,
 	})
 
-	fmt.Println("Kafka Consumer (Reader) Started and Listening...")
+	Info(context.Background(), "Kafka Consumer (Reader) Started and Listening...")
 
 	go func() {
 		defer close(kafkaConsumerDone) // 退出握手：A7 排空冷队列前必须等到这里
@@ -131,7 +131,7 @@ func StartKafkaConsumer(consumeHandler func([]byte) error) {
 		for {
 			select {
 			case <-kafkaQuit:
-				fmt.Println("Kafka consumer stopping, bye.")
+				Info(ctx, "Kafka consumer stopping, bye.")
 				return
 			default:
 			}
@@ -179,7 +179,7 @@ func StopKafkaConsumer() {
 		select {
 		case <-kafkaConsumerDone:
 		case <-time.After(10 * time.Second):
-			fmt.Println("【警告】Kafka 消费者退出超时，强制继续停机")
+			Warn(context.Background(), "Kafka 消费者退出超时，强制继续停机")
 		}
 	}
 	if kafkaReader != nil {
