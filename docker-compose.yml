@@ -11,7 +11,7 @@ services:
   mysql:
     image: mysql:8.0
     environment:
-      MYSQL_ROOT_PASSWORD: "111111"
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD}"
       MYSQL_DATABASE: ginchat
     volumes:
       - mysql_data:/var/lib/mysql
@@ -19,7 +19,7 @@ services:
     ports:
       - "127.0.0.1:13306:3306"
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p111111"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -70,7 +70,7 @@ services:
       context: .
       dockerfile: dockfile
     environment:
-      MYSQL_DNS: "root:111111@tcp(mysql:3306)/ginchat?charset=utf8mb4&parseTime=True&loc=Local"
+      MYSQL_DNS: "${MYSQL_DNS}"
       REDIS_ADDR: "redis:6379"
       KAFKA_BROKER: "kafka:9092"
       UPLOAD_PATH: "/data/upload"

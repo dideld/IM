@@ -1,19 +1,22 @@
 package models
 
-// 落盘后置放大分发（store-and-forward 的"分发/通知/回执"段）：
-//   冷层写入成功后，一条消息在此放大为——收件人投递（扇出）、未读维护（含离线推送挂点）、
-//   发送者 Type=6 ACK。WS 侧不再直接投递，"先落盘再投递"的顺序闸门由 persistMessage→cold writer 保证。
-//   另有生产侧的应用层重投队列：同步投 Kafka 失败不立刻报错，重投超限才回 -1 ACK。
+// 落地扇出与生产侧韧性（store-and-forward 的"分发/通知/回执 + 背压"段）：
+//   冷层写入成功后，一批消息在 landAndDeliver 内合并为"热层+门禁终值+未读"单 Pipeline，
+//   exec 成功后放大为——收件人投递（扇出）、Type=4 未读事件（带权威计数）、发送者 Type=6 ACK。
+//   WS 侧不再直接投递，"先落盘再投递"的顺序闸门由 聚合器→cold writer 保证（见 consume.go/store.go）。
+//   另有生产侧准入三态闸与应用层重投队列：同步投 Kafka 失败不立刻报错，重投超限才回 -1 ACK。
 
 import (
 	"context"
 	"encoding/json"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"webapp/utils"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/spf13/viper"
 	"golang.org/x/sync/singleflight"
 )
@@ -44,32 +47,134 @@ func ackTo(senderUid int64, clientMsgId, convId string, seq, msgId int64, status
 	deliverLocal(senderUid, data)
 }
 
-// deliverLanded 单条落盘成功后的放大投递。调用方：消费者(inline 档) / 冷 writer(batch 档 flush 成功后)。
-func deliverLanded(recs []landedRecord) {
+// landAndDeliver 冷层成功后的"落地扇出"合一管道（本批一次 Redis 往返）：
+// 热层 ZAdd(全员)+按会话修剪/续期 + 门禁终值 HSet + 未读 HIncrBy —— 全部合并；
+// exec 成功后才做纯内存扇出：消息原文 → Type=4 未读事件（携带管道算出的权威计数）→ 发送者 Type=6 ACK(0)。
+// 返回 err（内部已重试 3 次）→ 调用方对整批 failLanded 收口（其中 ZRem 清掉可能的半写热层残留）。
+func landAndDeliver(recs []landedRecord) error {
+	ctx := context.Background()
+	hotKeep := int64(cfgInt("storage.hotKeep", 200))
+	ttl := time.Duration(cfgInt("storage.hotTTLDays", 7)) * 24 * time.Hour
+
+	// 群成员表按会话取一次（g_members 缓存，singleflight 保护）；据此规划每个 rec 的收件人
+	membersOf := make(map[string][]int64, 4)
+	targets := make([][]int64, len(recs))
 	for i := range recs {
 		rec := &recs[i]
 		sender := int64(rec.parsed.UserId)
-		switch rec.parsed.Type {
-		case 2:
-			// 群聊：成员列表走 g_members 缓存（消费者热路径每条必查，绝不能裸打 MySQL）
-			members := GroupMembers(uint(rec.parsed.TargetId))
-			targets := make([]int64, 0, len(members))
-			for _, m := range members {
-				if m != sender {
-					deliverLocal(m, rec.raw)
-					targets = append(targets, m)
+		if rec.parsed.Type == 2 {
+			m := membersOf[rec.convId]
+			if m == nil {
+				m = GroupMembers(convGid(rec.convId))
+				if m == nil {
+					m = []int64{}
+				}
+				membersOf[rec.convId] = m
+			}
+			for _, uid := range m {
+				if uid != sender {
+					targets[i] = append(targets[i], uid)
 				}
 			}
-			pushUnread(rec, targets)
-		default:
-			// 私聊：直投目标（含"发给自己"的合法会话）；给自己发不累积未读
-			deliverLocal(rec.parsed.TargetId, rec.raw)
-			if rec.parsed.TargetId != sender {
-				pushUnread(rec, []int64{rec.parsed.TargetId})
+		} else if rec.parsed.TargetId != sender {
+			targets[i] = append(targets[i], rec.parsed.TargetId)
+		}
+	}
+
+	type incrReq struct {
+		uid   int64
+		recIx int
+	}
+	var incrs []*redis.IntCmd
+	var metas []incrReq
+	var execErr error
+	// 重试必须重建 pipeline（已 Exec 的 Cmd 不可复用），封成闭包
+	run := func() error {
+		incrs = incrs[:0]
+		metas = metas[:0]
+		pipe := utils.Red.Pipeline()
+		for i := range recs {
+			pipe.ZAdd(ctx, recs[i].convId, redis.Z{Score: float64(recs[i].seq), Member: recs[i].raw})
+		}
+		for _, cid := range distinctConvs(recs) {
+			pipe.ZRemRangeByRank(ctx, cid, 0, -(hotKeep + 1))
+			pipe.Expire(ctx, cid, ttl)
+			pipe.Expire(ctx, "cm:"+cid, ttl)
+		}
+		for i := range recs {
+			if recs[i].clientMsgId != "" {
+				pipe.HSet(ctx, "cm:"+recs[i].convId, recs[i].clientMsgId,
+					strconv.FormatInt(recs[i].seq, 10)+":"+strconv.FormatInt(recs[i].msgId, 10))
 			}
 		}
-		ackTo(sender, rec.clientMsgId, rec.convId, rec.seq, rec.msgId, 0, "")
+		for i := range recs {
+			for _, uid := range targets[i] {
+				incrs = append(incrs, pipe.HIncrBy(ctx, unreadKeyPrefix+strconv.FormatInt(uid, 10), recs[i].convId, 1))
+				metas = append(metas, incrReq{uid: uid, recIx: i})
+			}
+		}
+		_, err := pipe.Exec(ctx)
+		return err
 	}
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(50*(attempt+1)) * time.Millisecond)
+		}
+		if execErr = run(); execErr == nil {
+			break
+		}
+	}
+	if execErr != nil {
+		return execErr
+	}
+
+	// —— exec 成功后才扇出（内存路径，无失败回滚需求）——
+	for i := range recs {
+		rec := &recs[i]
+		for _, uid := range targets[i] {
+			deliverLocal(uid, rec.raw)
+		}
+	}
+	previewOf := make([]string, len(recs))
+	for i := range recs {
+		previewOf[i] = mediaPreview(recs[i].parsed)
+	}
+	for k, meta := range metas {
+		n, err := incrs[k].Result()
+		if err != nil {
+			utils.Error(ctx, "unread HIncrBy 结果异常", "uid", meta.uid, "error", err)
+			continue
+		}
+		rec := &recs[meta.recIx]
+		evt, err := json.Marshal(map[string]interface{}{"Type": 4, "ConvId": rec.convId, "Seq": rec.seq, "Unread": n})
+		if err == nil {
+			deliverLocal(meta.uid, evt)
+		}
+		if pushEnabled() && !WsHub.HasOnline(meta.uid) {
+			utils.OfflinePush(meta.uid, utils.PushSummary{
+				ConvId: rec.convId, Seq: rec.seq, MsgId: rec.msgId,
+				Sender: int64(rec.parsed.UserId), MsgType: rec.parsed.Type, Preview: previewOf[meta.recIx],
+			})
+		}
+	}
+	for i := range recs {
+		rec := &recs[i]
+		ackTo(int64(rec.parsed.UserId), rec.clientMsgId, rec.convId, rec.seq, rec.msgId, 0, "")
+	}
+	// 门禁 HASH 近窗修剪按会话一次
+	for _, cid := range distinctConvs(recs) {
+		trimCmSet(cid, hotKeep)
+	}
+	return nil
+}
+
+// convGid "g_{群id}" → 群 id（解析失败返回 0）
+func convGid(convId string) uint {
+	gid, err := strconv.ParseUint(strings.TrimPrefix(convId, "g_"), 10, 32)
+	if err != nil {
+		return 0
+	}
+	return uint(gid)
 }
 
 // failLanded 落库失败收口：回滚热层（A2：冷是全集，热的不可丢副本必须一并撤，
@@ -109,10 +214,11 @@ func dlqHold(rec landedRecord, reason string) {
 	utils.Red.LTrim(ctx, "msg:dlq", -500, -1)
 }
 
-// ===== 生产侧应用层重投队列 =====
+// ===== 生产侧应用层重投队列 & 入口准入三态闸 =====
 
 type pendingProduce struct {
 	data        []byte
+	key         string // Kafka 消息 Key=convId：同会话恒同分区（seq 单写者前提，多分区扩展的硬依赖）
 	senderUid   int64
 	clientMsgId string
 	convId      string
@@ -125,26 +231,67 @@ var (
 	ppOnce  sync.Once
 )
 
-// produceOrDefer WS 侧唯一入队路径：同步 Produce 失败先落进程内重投队列（2s 一轮，至多 5 次），
-// 超限才回 -1 ACK。语义（拍板）：Kafka/DB 类失败在重试耗尽前"不 ACK 也不报成功"，
-// 客户端靠 pending+超时重发兜底；参数非法则是 recvProc 校验阶段的即时 -1（不进本队列）。
+const (
+	ppMaxQueue     = 10000 // 重投队列上限：服务长时间不可用时快速失败而不是无限吃内存
+	admissionGreen = 0.60  // 水位低于此：放行
+	admissionRed   = 0.85  // 水位高于此：拒新（-1 server_busy）；之间为黄区线性节流
+)
+
+// pipelinePressure 入口管道水位 = max(冷 unit 队列, 聚合入口 consumeCh, 重投队列)。
+// 这是背压信号源：停摆时消费者被 enqueueCold 阻塞、新消息在 coldCh 与 ppQueue 两头堆积，
+// 水位先到红区——拒绝的新消息唯一副本仍在客户端，零丢失零重复。
+func pipelinePressure() float64 {
+	p := 0.0
+	if ul, uc := ColdQueueLen(); uc > 0 && float64(ul)/float64(uc) > p {
+		p = float64(ul) / float64(uc)
+	}
+	if cl, cc := consumeQueueLen(); cc > 0 && float64(cl)/float64(cc) > p {
+		p = float64(cl) / float64(cc)
+	}
+	ppMu.Lock()
+	q := float64(len(ppQueue)) / float64(ppMaxQueue)
+	ppMu.Unlock()
+	if q > p {
+		p = q
+	}
+	return p
+}
+
+// produceOrDefer WS 侧唯一入队路径。三段语义：
+//  1. 红区（≥0.85）直接即时 -1 ACK(Reason=server_busy)，不产生 Kafka/队列压力；
+//     前端对该 reason 走 5s/10s/20s 退避重发——切断"ACK 超时→立即重发"的过载正反馈放大器。
+//  2. 黄区（0.60~0.85）produce 前线性节流（0→10ms），只加延迟不丢消息。
+//  3. 绿区正常同步 Produce（Key=convId）；失败进进程内重投队列，超限才回 -1 ACK。
+//
+// Kafka/DB 类失败在重试耗尽前"不 ACK 也不报成功"，客户端 pending 重发兜底；参数非法在 recvProc 即时 -1（不进本队列）。
 func produceOrDefer(senderUid int64, m *Message, data []byte) {
-	if err := utils.Produce(data); err == nil {
+	conv := convIdForAck(m)
+	if p := pipelinePressure(); p >= admissionRed {
+		ackTo(senderUid, m.ClientMsgId, conv, 0, 0, -1, "server_busy(系统过载，稍后自动重试)")
+		return
+	} else if p >= admissionGreen {
+		ms := int64(10 * (p - admissionGreen) / (admissionRed - admissionGreen))
+		if ms > 0 {
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
+	}
+	if err := utils.Produce(data, conv); err == nil {
 		return
 	} else {
 		utils.Error(context.Background(), "Kafka 生产失败，进入应用层重投队列", "error", err)
 	}
 	ppMu.Lock()
-	if len(ppQueue) >= 10000 { // 队列上限：服务长时间不可用时快速失败而不是无限吃内存
+	if len(ppQueue) >= ppMaxQueue {
 		ppMu.Unlock()
-		ackTo(senderUid, m.ClientMsgId, convIdForAck(m), 0, 0, -1, "消息服务不可用(重投队列已满)")
+		ackTo(senderUid, m.ClientMsgId, conv, 0, 0, -1, "消息服务不可用(重投队列已满)")
 		return
 	}
 	ppQueue = append(ppQueue, pendingProduce{
 		data:        append([]byte(nil), data...),
+		key:         conv,
 		senderUid:   senderUid,
 		clientMsgId: m.ClientMsgId,
-		convId:      convIdForAck(m),
+		convId:      conv,
 		attempts:    1,
 	})
 	ppMu.Unlock()
@@ -153,7 +300,7 @@ func produceOrDefer(senderUid int64, m *Message, data []byte) {
 
 func startProducePump() {
 	go func() {
-		t := time.NewTicker(2 * time.Second)
+		t := time.NewTicker(500 * time.Millisecond)
 		defer t.Stop()
 		for range t.C {
 			ppMu.Lock()
@@ -164,9 +311,9 @@ func startProducePump() {
 			keep := ppQueue[:0]
 			var dead []pendingProduce
 			for _, p := range ppQueue {
-				if err := utils.Produce(p.data); err != nil {
+				if err := utils.Produce(p.data, p.key); err != nil {
 					p.attempts++
-					if p.attempts > 5 {
+					if p.attempts > 3 {
 						dead = append(dead, p)
 					} else {
 						keep = append(keep, p)

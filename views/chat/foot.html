@@ -336,6 +336,7 @@
                     // 私聊本地先挂气泡并置 pending；群聊维持原 UX(自己不弹泡，其他成员经落盘分发收到)
                     var bubble = (msg.Type == 1) ? this.showmsg(userInfo(), msg, false, false, true) : null;
                     this.pending[msg.clientMsgId] = { msg: msg, bubble: bubble, tries: 0, timer: null };
+                    this._persistPending(); // 崩溃/刷新不丢未确认消息（localStorage 兜底，重连自动补发）
                     this._trySend(msg.clientMsgId);
                 },
                 _trySend: function (id) {
@@ -357,21 +358,40 @@
                             that._trySend(id); // 超时重发同 clientMsgId：服务端幂等命中会回补原 ACK(带 Seq/MsgId)
                         } else {
                             delete that.pending[id];
+                            that._persistPending();
                             if (q.bubble) Vue.set(q.bubble, 'mstat', 'fail');
                         }
                     }, 10000);
                 },
                 ackMsg: function (data) {
-                    var p = this.pending[data.ClientMsgId];
+                    var that = this;
+                    var id = data.ClientMsgId;
+                    var p = this.pending[id];
                     if (!p) return; // 迟到/重放补发的 ACK：无 pending 即无需对账
                     clearTimeout(p.timer);
-                    delete this.pending[data.ClientMsgId];
-                    if (!p.bubble) return;
                     if (data.Status === 0) {
+                        delete this.pending[id];
+                        this._persistPending();
+                        if (!p.bubble) return;
                         Vue.set(p.bubble, 'mstat', 'sent');
                         if (data.Seq) Vue.set(p.bubble, 'seq', data.Seq); // seq 回填：群"N人已读"徽章的对账依据
                         if (data.MsgId) p.mid = data.MsgId;
-                    } else {
+                        return
+                    }
+                    // 准入闸红区拒绝（server_busy）：保留 pending，5s/10s/20s 指数退避重发同一 clientMsgId
+                    // ——切断"超时立即重发"在过载期把入口打成正反馈的放大器；服务端幂等保证不重复落库。
+                    if (data.Reason && data.Reason.indexOf('server_busy') === 0 && (p.busy || 0) < 3) {
+                        p.busy = (p.busy || 0) + 1
+                        p.timer = setTimeout(function () {
+                            var q = that.pending[id];
+                            if (q) that._trySend(id)
+                        }, 5000 * Math.pow(2, p.busy - 1))
+                        if (p.bubble) Vue.set(p.bubble, 'mstat', 'sending')
+                        return
+                    }
+                    delete this.pending[id];
+                    this._persistPending();
+                    if (p.bubble) {
                         Vue.set(p.bubble, 'mstat', 'fail');
                         if (data.Reason) mui.toast('发送失败：' + data.Reason);
                     }
@@ -384,11 +404,31 @@
                     this._trySend(id);
                 },
                 flushPending: function () { // 重连成功：pending 全量补发（先清零 tries，给新一轮 3 次机会）
+                    this.restorePending(); // 先并回 localStorage 里跨刷新幸存的未确认消息
                     for (var id in this.pending) {
                         var p = this.pending[id];
                         p.tries = 0;
                         this._trySend(id);
                     }
+                },
+                _persistPending: function () {
+                    try {
+                        var out = {}
+                        for (var id in this.pending) { out[id] = { msg: this.pending[id].msg } }
+                        localStorage.setItem('pending:' + userId(), JSON.stringify(out))
+                    } catch (e) { /* 容量满/隐私模式：降级为仅内存 pending，不影响发送 */ }
+                },
+                restorePending: function () {
+                    try {
+                        var raw = localStorage.getItem('pending:' + userId());
+                        if (!raw) return;
+                        var obj = JSON.parse(raw)
+                        for (var id in obj) {
+                            if (!this.pending[id]) {
+                                this.pending[id] = { msg: obj[id].msg, bubble: null, tries: 0, timer: null }
+                            }
+                        }
+                    } catch (e) { }
                 },
                 readerCount: function (item) {
                     return item.greaders ? Object.keys(item.greaders).length : 0;

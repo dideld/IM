@@ -219,10 +219,7 @@ func init() {
 
 }
 
-// StartKafkaConsumer 对外暴露给 main 函数，用于注册消费群组回调（冷热双层持久化）
-func StartKafkaConsumer() {
-	utils.StartKafkaConsumer(persistMessage)
-}
+// StartKafkaConsumer 消费链入口在 consume.go（聚合器 + 冷 writer 协同），message.go 不再持有。
 
 func udpRevProc(){
 	con,err:=net.ListenUDP("udp",&net.UDPAddr{

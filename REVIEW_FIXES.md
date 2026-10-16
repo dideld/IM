@@ -60,6 +60,32 @@
 - **RequireAll≠真高可用**：单 broker 下等价 min.insync=1；生产清单（3 broker + min.insync.replicas=2 + partitions>1）记入 README 面试口径。当前 topic 单分区也是消费并行度上限。
 - **A4 的 Redis 锁替代方案**：审查建议的 `SETNX markread 锁` 有 TTL 过期与临界区赛跑的残余窗口，事务方案是严格占优，采纳事务。
 
+## MQ 流水线优化轮（2026-10-15，基于"背压 vs 推拉"方案评审）
+
+| 项 | 内容 | 验证 |
+|---|---|---|
+| **提交权移交** | batch 档消费者入队即返回 `ErrCommitDeferred` 继续 fetch；冷 writer 每批落库+投递收口后跨协程 `CommitKafka`（FIFO ⇒ 已处理连续前缀）；批级 panic recover（整批失败收口+照常提交，writer 不静默死亡）；`rec.done` 同步等待拆除 | ack 档 300 连接：完成 ~460/s，LAG 稳定跟随在途窗口，冲突警告 0，dup=幂等回补路径真实运转 |
+| **Produce Key=convId** | 同会话恒同分区——多分区扩展下 seq 单写者前提的硬依赖（当前 1 分区也先立规矩）；`kafka.partitions` 配置化（仅影响首建） | 编译级（单分区行为不变） |
+| **入口准入三态闸** | `pipelinePressure`=max(coldCh,ppQueue 占用)；绿<0.6 放行、黄 0.6~0.85 线性节流（只延迟不丢）、红≥0.85 即时 `-1 server_busy`；前端对该 reason 改 5s/10s/20s 指数退避 + **pending 落 localStorage 跨刷新幸存** | 拔 MySQL 演练：红区拒收 22143 条、恢复后拒收停增、ACK 回正、LAG 单调收敛；慢端被 DataQueue 背压单端踢线（设计行为）复现 |
+| **停机定序修订** | reader 关闭从 StopKafkaConsumer 挪到最后一步 `CloseKafka`——冷 writer 排空收尾需要活着 reader 提交 | 代码审查（Windows taskkill 非优雅信号，Ctrl+C 场景留前台人工确认） |
+
+**运行时观察（下一步优化线索）**：饱和吞吐 ~460/s 的瓶颈是消费者**逐条串行 ~5 次 Redis RTT**（Docker Desktop NAT 下每次 ~0.3ms+）——下一步可做"批内同会话 Redis 操作合并 + 门禁终值化挪到 flush 后"，理论再抬一个数量级。
+
+**验证后清理**：bench 冷层/热层/未读/cm/seq 键全删；`chat_messages` topic 删除（防 taskkill 后残留 1445 条未提交重放复活脏数据），服务下次启动 ensureTopic 自动重建。
+
+## 批内 Redis 合并轮（2026-10-15，"聚合器+落地合一管道"）
+
+| 变更 | 说明 | 实测 |
+|---|---|---|
+| **消费聚合器**（models/consume.go 新增） | 消费者 fetch 即入 `consumeCh`；2ms/500 条窗口攒批：门禁 HSetNX **一批一 Pipeline**、每会话 **INCRBY n** 批量发号（到达序映射连续 seq，status 数组保序回填）、批内 (conv\|cmid) 本地去重；`coldUnit{recs, commitTo}` 进 unit 通道（64 深，满=停摆背压同旧语义） | 100 连接闭环 **1275/s**（旧串行 460/s 的 2.8×），**丢包 0 / LAG 0 / 热层无洞期运行正常** |
+| **门禁终值挪到 flush 后** | "P" 占位在聚合器；终值 `seq:msgId` 与热层 ZAdd/修剪/未读 HINCRBY **合并为 landAndDeliver 单 Pipeline**，冷层成功+exec 成功才扇出（原文→Type4 带权威计数→ACK）；"落库未投递"崩溃窗口的重放见 "P" 继续落库，由唯一索引幂等兜底 | 双开重发副本 ack 补发路径（dup 计数）与旧行为一致 |
+| **落库前幂等对账 splitAlreadyLanded** | 发现终值后移引入的新竞态：INSERT 成功~终值写出的窗口内，副本穿过门禁混入后续 unit——直接插撞 `uk_conv_cmid`。writer 每批先做 ①跨 unit 批内 seen 去重 ②DB 已存行查询→副本转"重放"（回补原 seq/msgId ACK，不污染热层/未读/终值） | 行层证据：(conv,cmid)/(conv,seq) 重复均为 **0** |
+| **inline 档并轨** | inline = unit 窗口 0/批 1 的同路径特例，删掉第二套写法 | 冷读路径行为不变 |
+| **bench v3 拒收冷却**（test/bench_ws.go） | ack 模式收到 server_busy 后每连接 300ms 冷却再补窗——否则压测客户端自己成洪泛器（此前 30 秒刷出 62 万 attempted 假数据） | storm 消失，attempted≈完成 |
+| 运维注记 | **topic 不可在服务运行中删除**（kafka-go Reader 对删除重建会静默挂住，本会话实测踩坑），停机窗口清理或重启服务；`conflict_count:1/批` 的告警在副本场景可能由合法重放触发（文案已含双病因） | — |
+
+**残留边缘（如实记录，未修完）**：mq6 终验仍有 ~0.2% 唯一冲突告警伴生**无害 seq 洞**（丢的只有编号，非数据：行层无重复无缺失、LAG 0、丢包 0）。疑点收敛到雪花"借时"分支跨 unit 边界与启动回放交叠，需要专项复现（构造时钟回拨+副本注入）。影响评级：仅游标美观/告警噪音，无正确性损伤；列入待办。
+
 ## 验证结果（运行时验收，全部通过）
 
 环境：compose redis/kafka/mysql + 原生服务端注入 `TIMEOUT_DELAYHEARTBEAT=8 HUB_MAXDEVICES=2`，真实 token 全链路（不开 dev 跳鉴权）。

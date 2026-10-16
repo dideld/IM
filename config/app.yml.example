@@ -25,6 +25,7 @@ kafka:
   broker: "host.docker.internal:9092"
   topic: "chat_messages"
   consumerGroup: "chat_redis_saver_group"
+  partitions: 1    # 仅影响 topic 首次创建；扩分区前确认 Produce Key=convId 已生效（同会话同分区=seq 单写者前提）
 
 # ---- 雪花算法 ----
 snowflake:
@@ -36,9 +37,11 @@ timeout:
 
 # ---- 冷热存储 ----
 storage:
-  coldMode: "batch"      # batch | inline
+  coldMode: "batch"      # batch | inline(=unit 1 的低延迟特例，同一代码路径)
   coldBatchSize: 100
   coldFlushMs: 50
+  aggregateWindowMs: 2   # 消费聚合窗口：攒批合并门禁/发号/落地 Pipeline（inline 档自动为 0）
+  aggregateMax: 500      # 单聚合窗口最大消息数
   hotKeep: 200           # 热层单会话保留条数
   hotTTLDays: 7
   skipBenchPersist: false

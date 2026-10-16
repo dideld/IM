@@ -47,9 +47,11 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		utils.Error(context.Background(), "HTTP Shutdown", "error", err)
 	}
+	// A7 三步定序：停 HTTP → 停消费（等 consumerDone，不关 reader）→ 排空冷队列（落完+投递+提交）
+	// → 最后 CloseKafka。batch 档提交权在冷 writer，reader 必须活到排空收尾之后。
 	utils.StopKafkaConsumer()
 	models.StopColdWriter()
-	utils.CloseKafkaProducer()
+	utils.CloseKafka()
 	utils.Info(context.Background(), "停机完成，冷数据已 flush")
 }
 

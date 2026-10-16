@@ -16,13 +16,11 @@ package models
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
 	"webapp/utils"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/spf13/viper"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -55,7 +53,8 @@ const (
 )
 
 // landedRecord 落盘管线的一条消息：raw=客户端原始字节（热层 member 与投递共用，避免二次序列化损耗），
-// parsed=结构视图（字段落冷库、分发寻址用），done=batch 模式下冷 writer 回写落库结果。
+// parsed=结构视图（字段落冷库、分发寻址用），kmsg=来源 Kafka 消息（冷 writer flush 后跨协程推进提交——
+// "消费者不等同步落盘"的流水线设计：提交权随消息移交，见 StartKafkaConsumer/ErrCommitDeferred）。
 type landedRecord struct {
 	raw         []byte
 	parsed      Message
@@ -63,7 +62,7 @@ type landedRecord struct {
 	seq         int64
 	msgId       int64
 	clientMsgId string
-	done        chan error
+	kmsg        utils.KafkaMsg
 }
 
 // toColdRow 还原冷存储行（主键显式写雪花 msgId）。
@@ -75,7 +74,7 @@ func (rec *landedRecord) toColdRow() Message {
 	return m
 }
 
-var coldCh = make(chan landedRecord, 8192)
+// coldCh/consumeCh 与聚合器见 consume.go（unit 通道，满=停摆天然背压）
 
 // coldStop 关闭后冷存 worker 排空队列、落完最后一批再退出（优雅停机）
 var coldStop chan struct{}
@@ -99,154 +98,6 @@ func coldModeVal() string {
 	return "batch"
 }
 
-// persistMessage Kafka 消费回调（at-least-once：返回 nil 消费端才提交 offset）。
-// 管线：幂等门禁 → 发 seq → 热层 → 冷写（成功为闸门）→ deliverLanded（分发+未读+ACK）。
-// 失败分级（拍板语义）：
-//   - Redis 瞬时故障 → 返回 error 不提交，Kafka 重投；
-//   - 冷写重试耗尽 / 存储持续不可用 → failLanded（清标记+死信+ACK-1）后照常提交，毒消息不占分区。
-func persistMessage(msgData []byte) error {
-	defer func() {
-		if r := recover(); r != nil {
-			utils.Error(context.Background(), "persistMessage panic (按失败提交，原文已尽力死信)", "recover", r)
-		}
-	}()
-	jsonMsg := Message{}
-	// 非 JSON（系统提示语等误入链路）直接跳过，防止污染会话 key（历史上 msg_0_0 就是这么来的）
-	if err := json.Unmarshal(msgData, &jsonMsg); err != nil {
-		utils.Warn(context.Background(), "persistMessage skip invalid payload", "error", err)
-		return nil
-	}
-	if jsonMsg.Type != 1 && jsonMsg.Type != 2 {
-		return nil // 心跳等不该进持久化链路
-	}
-
-	convId := convIdOf(jsonMsg.Type, int64(jsonMsg.UserId), jsonMsg.TargetId)
-	msgId := utils.GenSnowflakeId()
-	ctx := context.Background()
-
-	if viper.GetBool("storage.skipBenchPersist") && strings.HasPrefix(jsonMsg.ClientMsgId, "bench-") {
-		return nil // 压测旁路：不落库也不 ACK——要测"落库→ACK"全链路档必须关闭本开关
-	}
-
-	rec := landedRecord{
-		raw:         msgData,
-		parsed:      jsonMsg,
-		convId:      convId,
-		msgId:       msgId,
-		clientMsgId: jsonMsg.ClientMsgId,
-	}
-
-	// ---- 幂等门禁：HSetNX "P" 占位；已有终值=重放，回补原 ACK 不重复落库 ----
-	if rec.clientMsgId != "" {
-		ck := "cm:" + convId
-		created, err := utils.Red.HSetNX(ctx, ck, rec.clientMsgId, "P").Result()
-		if err != nil {
-			return err // Redis 瞬时故障：不提交，Kafka 重投
-		}
-		if !created {
-			v, _ := utils.Red.HGet(ctx, ck, rec.clientMsgId).Result()
-			if v != "" && v != "P" {
-				if parts := strings.SplitN(v, ":", 2); len(parts) == 2 {
-					sq, _ := strconv.ParseInt(parts[0], 10, 64)
-					mi, _ := strconv.ParseInt(parts[1], 10, 64)
-					ackTo(int64(jsonMsg.UserId), rec.clientMsgId, convId, sq, mi, 0, "") // 重放只补回执
-				}
-				return nil
-			}
-			// 残留 "P"：单消费者串行处理，说明上次尝试死在中途（offset 未提交才重投到此），本次继续落库
-		}
-	}
-
-	// ---- 发 seq（会话级严格递增；瞬时故障走 Kafka 重投）----
-	seq, err := redIncrRetry(ctx, seqKeyPrefix+convId)
-	if err != nil {
-		utils.Error(ctx, "seq INCR failed(重投)", "convId", convId, "error", err)
-		return err
-	}
-	rec.seq = seq
-
-	// ---- 热层 + 去重标记终值化：一次 Pipeline ----
-	hotKeep := int64(cfgInt("storage.hotKeep", 200))
-	ttl := time.Duration(cfgInt("storage.hotTTLDays", 7)) * 24 * time.Hour
-	pipe := utils.Red.Pipeline()
-	pipe.ZAdd(ctx, convId, redis.Z{Score: float64(seq), Member: msgData})
-	pipe.ZRemRangeByRank(ctx, convId, 0, -(hotKeep + 1))
-	pipe.Expire(ctx, convId, ttl)
-	if rec.clientMsgId != "" {
-		ck := "cm:" + convId
-		pipe.HSet(ctx, ck, rec.clientMsgId, strconv.FormatInt(seq, 10)+":"+strconv.FormatInt(msgId, 10))
-		pipe.Expire(ctx, ck, ttl)
-	}
-	if _, err := pipe.Exec(ctx); err != nil {
-		utils.Error(ctx, "Redis hot persist Error(重投)", "error", err)
-		return err
-	}
-	if rec.clientMsgId != "" {
-		trimCmSet(convId, hotKeep)
-	}
-
-	// ---- 冷写闸门：成功才允许投递 ----
-	if coldModeVal() == "inline" {
-		if err := coldInsertRetry([]landedRecord{rec}); err != nil {
-			failLanded(rec, "冷存储写入失败")
-			return nil
-		}
-		deliverLanded([]landedRecord{rec})
-		return nil
-	}
-	rec.done = make(chan error, 1)
-	if err := enqueueCold(rec); err != nil {
-		return err // 停机放弃入队：offset 不提交，重启后由 Kafka 重放（幂等门禁兜底）
-	}
-	if err := <-rec.done; err != nil {
-		return nil // 冷 writer 已完成 failLanded（回滚热层/清标记/死信/错误 ACK）
-	}
-	return nil
-}
-
-// enqueueCold 入冷队列：队列满=存储管道停摆（MySQL 不可用等），此时**正确行为就是停住消费者**
-// （Kafka 天然缓冲、offset 不提交），但必须出声——每 5s 一条【警告】，并响应停机信号。
-func enqueueCold(rec landedRecord) error {
-	stallTicker := time.NewTicker(5 * time.Second)
-	defer stallTicker.Stop()
-	for {
-		select {
-		case coldCh <- rec:
-			return nil
-		case <-stallTicker.C:
-			utils.Warn(context.Background(), "冷管道停摆：coldCh 满，Kafka 消费者暂停(offset 未提交靠重放)，检查 MySQL！",
-				"queue_len", len(coldCh), "queue_cap", cap(coldCh))
-		}
-		if utils.KafkaStopping() {
-			// 停机中放弃入队：清去重占位让重放走全新落库，返回 error 使 offset 不提交
-			if rec.clientMsgId != "" {
-				utils.Red.HDel(context.Background(), "cm:"+rec.convId, rec.clientMsgId)
-			}
-			return fmt.Errorf("shutting down, 放弃入队待重放: %s", rec.clientMsgId)
-		}
-	}
-}
-
-// ColdQueueLen 冷队列水位（monitor 观测用）
-func ColdQueueLen() (int, int) { return len(coldCh), cap(coldCh) }
-
-// redIncrRetry seq 发号带小重试：区分"瞬时抖动"和"持续不可用"，前者靠 Kafka 重投自愈。
-func redIncrRetry(ctx context.Context, key string) (int64, error) {
-	var (
-		seq int64
-		err error
-	)
-	for i := 0; i < 3; i++ {
-		if i > 0 {
-			time.Sleep(time.Duration(50*(i+1)) * time.Millisecond)
-		}
-		if seq, err = utils.Red.Incr(ctx, key).Result(); err == nil {
-			return seq, nil
-		}
-	}
-	return 0, err
-}
-
 // trimCmSet 去重 HASH 近窗修剪：超 2×hotKeep 随机淘汰（Redis<6.2 无 HRandField 时放弃修剪，靠 key TTL 兜底）。
 func trimCmSet(convId string, hotKeep int64) {
 	ctx := context.Background()
@@ -260,33 +111,6 @@ func trimCmSet(convId string, hotKeep int64) {
 		return
 	}
 	utils.Red.HDel(ctx, ck, fields...)
-}
-
-// pushUnread 未读 +1 并向在线端推 Type=4 事件；开启推送挂点时对"无任何在线设备"的收件人调 OfflinePush。
-// 注意：离线判定走 Hub probe 通道（clients 只能 Run 内触碰）；push 开关关闭时零探测开销。
-func pushUnread(rec *landedRecord, uids []int64) {
-	ctx := context.Background()
-	preview := mediaPreview(rec.parsed)
-	for _, uid := range uids {
-		uk := unreadKeyPrefix + strconv.FormatInt(uid, 10)
-		n, err := utils.Red.HIncrBy(ctx, uk, rec.convId, 1).Result()
-		if err != nil {
-			utils.Error(ctx, "unread HIncrBy error", "key", uk, "error", err)
-			continue
-		}
-		evt, err := json.Marshal(map[string]interface{}{"Type": 4, "ConvId": rec.convId, "Seq": rec.seq, "Unread": n})
-		if err != nil {
-			continue
-		}
-		// 仅内存推送，不落任何存储；离线用户下次 unreadList 拉全量补偿
-		deliverLocal(uid, evt)
-		if pushEnabled() && !WsHub.HasOnline(uid) {
-			utils.OfflinePush(uid, utils.PushSummary{
-				ConvId: rec.convId, Seq: rec.seq, MsgId: rec.msgId,
-				Sender: int64(rec.parsed.UserId), MsgType: rec.parsed.Type, Preview: preview,
-			})
-		}
-	}
 }
 
 // ConvHasMember 会话成员校验（HTTP 鉴权后仍要挡"读别人会话"）：
@@ -495,64 +319,98 @@ func UnreadMap(userId int64) map[string]int64 {
 	return out
 }
 
-// StartColdWriter 冷存储批量落盘 worker（batch 档）：攒够 coldBatchSize 条或等 coldFlushMs 毫秒即写 MySQL。
-// 顺序铁律：CreateInBatches 成功 → deliverLanded（投递+ACK）→ 回 done；失败（重试后）→ failLanded → done(err)。
-// 必须在 utils.InitMysql() 之后、Kafka 消费者启动之前调用
+// StartColdWriter 冷存储 worker（唯一落库/投递/提交路径，inline 档=unit size 1 的特例）：
+// 攒够 coldBatchSize 条记录或等 coldFlushMs 即 flush。
+// 顺序铁律（一次 flush 内）：CreateInBatches 成功 → landAndDeliver（热层+门禁终值+未读 单 Pipeline →
+// 投递/ACK 扇出）→ commitFrom(本组全部输入 offset)；任一硬失败 → failLanded 收口后**照常提交**（毒消息不占分区）。
+// 必须在 utils.InitMysql() 之后、Kafka 消费者启动之前调用。
 func StartColdWriter() {
 	coldStop = make(chan struct{})
 	coldDone = make(chan struct{})
 	batchSize := cfgInt("storage.coldBatchSize", 100)
-	// 默认 50ms：先落盘再投递后，攒批等待直接叠加到消息端到端时延（原 200ms 是纯归档链路时可容忍）
+	if coldModeVal() == "inline" {
+		batchSize = 1 // inline=每条立即 flush 的同一路径（窗口 0、批 1），不再维护第二套写法
+	}
+	// 默认 50ms：先落盘再投递后，攒批等待直接叠加到消息端到端时延
 	flush := time.Duration(cfgInt("storage.coldFlushMs", 50)) * time.Millisecond
 
 	go func() {
-		batch := make([]landedRecord, 0, batchSize)
+		units := make([]coldUnit, 0, 8)
+		recCount := 0
 		ticker := time.NewTicker(flush)
 		defer ticker.Stop()
 
-		flushBatch := func() {
-			if len(batch) == 0 {
+		flushUnits := func() {
+			if len(units) == 0 {
 				return
 			}
-			if err := coldInsertRetry(batch); err != nil {
-				for i := range batch {
-					failLanded(batch[i], "冷存储写入失败")
-					if batch[i].done != nil {
-						batch[i].done <- err
+			batch := units
+			units = units[:0]
+			recCount = 0
+			// 批级 panic 保险（不可协程式 recover 后退出——writer 死了移交消息变静默丢失）
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						utils.Error(context.Background(), "cold writer flush panic（整批失败收口并推进提交）", "recover", r)
+						var all []landedRecord
+						for _, u := range batch {
+							all = append(all, u.recs...)
+						}
+						failRecs(all, "cold writer panic")
+					}
+				}()
+				var all []landedRecord
+				for _, u := range batch {
+					all = append(all, u.recs...)
+				}
+				// 落库前幂等对账（消除门禁终值窗口竞态）：INSERT 成功~land Pipeline 写终值之间，
+				// 重发副本可能穿过 HSetNX 门禁混进后续 unit——直接插入会撞 uk_conv_cmid（跳过+告警+
+				// 终值/热层 score 被副本新 seq 顶掉）。对账把副本转成"重放"：回补原 seq/msgId 的 ACK，
+				// 不占热层、不重计未读、不改写终值。writer 单协程顺序执行 ⇒ 查插在"本批完成前"闭环无竞态。
+				fresh, replays := splitAlreadyLanded(all)
+				if len(fresh) > 0 && coldInsertRetry(fresh) != nil {
+					failRecs(fresh, "冷存储写入失败")
+				} else if len(fresh) > 0 {
+					if err := landAndDeliver(fresh); err != nil {
+						utils.Error(context.Background(), "land pipeline 失败，整批失败收口", "error", err)
+						failRecs(fresh, "投递落盘失败")
 					}
 				}
-			} else {
-				deliverLanded(batch) // 冷层成功是投递的前置闸门
-				for i := range batch {
-					if batch[i].done != nil {
-						batch[i].done <- nil
-					}
+				for _, rp := range replays {
+					ackTo(int64(rp.parsed.UserId), rp.clientMsgId, rp.convId, rp.seq, rp.msgId, 0, "")
 				}
-			}
-			batch = batch[:0]
+				// 提交恒推进（成功=已投递；失败=failLanded 死信+错误 ACK 收口）——批 FIFO ⇒ 连续前缀
+				var commitTo []utils.KafkaMsg
+				for _, u := range batch {
+					commitTo = append(commitTo, u.commitTo...)
+				}
+				commitFrom(commitTo)
+			}()
 		}
 
 		for {
 			select {
-			case rec := <-coldCh:
-				batch = append(batch, rec)
-				if len(batch) >= batchSize {
-					flushBatch()
+			case u := <-coldCh:
+				units = append(units, u)
+				recCount += len(u.recs)
+				if recCount >= batchSize {
+					flushUnits()
 				}
 			case <-ticker.C:
-				flushBatch()
+				flushUnits()
 			case <-coldStop:
-				// 排空在途队列后做最后一次落盘+投递再退出（宁慢勿丢）
+				// 排空在途队列后做最后一轮 落库+投递+提交 再退出（宁慢勿丢）
 				for {
 					select {
-					case rec := <-coldCh:
-						batch = append(batch, rec)
-						if len(batch) >= batchSize {
-							flushBatch()
+					case u := <-coldCh:
+						units = append(units, u)
+						recCount += len(u.recs)
+						if recCount >= batchSize {
+							flushUnits()
 						}
 					default:
-						flushBatch()
-						utils.Info(context.Background(), "cold writer stopped, final flush+deliver done")
+						flushUnits()
+						utils.Info(context.Background(), "cold writer stopped, final flush+deliver+commit done")
 						close(coldDone)
 						return
 					}
@@ -561,6 +419,82 @@ func StartColdWriter() {
 		}
 	}()
 	utils.Info(context.Background(), "cold writer started", "mode", coldModeVal(), "batchSize", batchSize, "flushInterval", flush.String())
+}
+
+// failRecs 对一批记录执行 failLanded 收口（清标记+死信+错误 ACK）。
+func failRecs(recs []landedRecord, reason string) {
+	for i := range recs {
+		failLanded(recs[i], reason)
+	}
+}
+
+// splitAlreadyLanded 落库前幂等对账：按 (conv_key, client_msg_id) 索引查出已落库的副本重定向为"重放"。
+// 无 clientMsgId 的记录（UDP 旁路等）不参与对账。查询走 uk_conv_cmid 复合索引，单批 ≤500 组。
+//
+// 两层防御：①先做批内(跨 unit)去重——同一 flush 合并多个 unit 时，重复副本双双未写库、
+// lookup 查无可见，直接同语句 INSERT 会撞 uk_conv_cmid（跳过+告警+seq 洞）；保留首见者
+// （入队更早、seq 更小），后见静默丢弃：客户端由首见者的落库路径拿到 ACK，offset 随批提交。
+// ②再对 DB 已有行做 replay 重定向（跨 flush 的重发/重放副本）。
+func splitAlreadyLanded(recs []landedRecord) (fresh []landedRecord, replays []landedRecord) {
+	seen := make(map[string]bool, len(recs))
+	deduped := make([]landedRecord, 0, len(recs))
+	for _, rec := range recs {
+		if rec.clientMsgId != "" {
+			key := rec.convId + "|" + rec.clientMsgId
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+		}
+		deduped = append(deduped, rec)
+	}
+	recs = deduped
+
+	byConv := make(map[string][]string, 8)
+	for i := range recs {
+		if recs[i].clientMsgId != "" {
+			byConv[recs[i].convId] = append(byConv[recs[i].convId], recs[i].clientMsgId)
+		}
+	}
+	if len(byConv) == 0 {
+		return recs, nil
+	}
+	type landedRow struct {
+		ConvKey     string
+		ClientMsgId string `gorm:"column:client_msg_id"`
+		Seq         int64
+		ID          uint64 `gorm:"column:id"`
+	}
+	var where strings.Builder
+	var args []interface{}
+	for cid, cmids := range byConv {
+		if where.Len() > 0 {
+			where.WriteString(" OR ")
+		}
+		where.WriteString("(conv_key = ? AND client_msg_id IN (?))")
+		args = append(args, cid, cmids)
+	}
+	var rows []landedRow
+	if err := utils.DB.Table("message").Select("conv_key, client_msg_id, seq, id").
+		Where(where.String(), args...).Find(&rows).Error; err != nil {
+		utils.Error(context.Background(), "幂等对账查询失败(按全新处理，唯一索引兜底)", "error", err)
+		return recs, nil
+	}
+	hit := make(map[string]landedRow, len(rows))
+	for _, r := range rows {
+		hit[r.ConvKey+"|"+r.ClientMsgId] = r
+	}
+	for _, rec := range recs {
+		if rec.clientMsgId != "" {
+			if r, ok := hit[rec.convId+"|"+rec.clientMsgId]; ok {
+				rec.seq, rec.msgId = r.Seq, int64(r.ID) // 回补原身份
+				replays = append(replays, rec)
+				continue
+			}
+		}
+		fresh = append(fresh, rec)
+	}
+	return fresh, replays
 }
 
 // coldInsertRetry 冷层写入（batch/inline 共用）：3 次尝试，主键/唯一冲突跳过（DoNothing）。
@@ -589,7 +523,29 @@ func coldInsertRetry(batch []landedRecord) error {
 	return err
 }
 
-// StopColdWriter 通知冷存 worker 排空并落完最后一批（含投递/ACK 收尾），阻塞至其真正退出（最长 10s）
+// commitFrom 把已 flush 组的全部输入消息（含被丢弃/重放帧——它们的 offset 也必须提交，毒消息不占分区）
+// 按分区取最高位推进为组提交 offset（跨协程提交由 kafka-go offsets store 内部互斥保证）。
+// 提交失败只告警不重试：下次重启/重平衡从旧 offset 重放，幂等门禁（cm）保证不双落——宁可重放一次，不可卡死分区。
+func commitFrom(msgs []utils.KafkaMsg) {
+	maxByPart := make(map[int]utils.KafkaMsg, 2)
+	for _, m := range msgs {
+		if cur, ok := maxByPart[m.Partition]; !ok || m.Offset > cur.Offset {
+			maxByPart[m.Partition] = m
+		}
+	}
+	toCommit := make([]utils.KafkaMsg, 0, len(maxByPart))
+	for _, m := range maxByPart {
+		toCommit = append(toCommit, m)
+	}
+	if len(toCommit) == 0 {
+		return
+	}
+	if err := utils.CommitKafka(toCommit...); err != nil {
+		utils.Warn(context.Background(), "cold writer commit 失败（重启后重放由幂等兜底）", "error", err)
+	}
+}
+
+// StopColdWriter 通知冷存 worker 排空并落完最后一批（含投递/ACK/提交收尾），阻塞至其真正退出（最长 10s）
 func StopColdWriter() {
 	if coldStop == nil {
 		return

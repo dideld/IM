@@ -329,6 +329,7 @@ func runLive(conn *websocket.Conn, st *connState, W int) string {
 
 	var L sync.Mutex
 	inflight := make(map[int64]time.Time, W+1)
+	var coolUntil time.Time // 拒收(server_busy)后的每连接冷却——与浏览器端同一退避原则，防压测客户端变洪泛器
 	defer func() { // 本连接死亡时在途全清，归还在途 gauge（未回执的不再等待）
 		L.Lock()
 		n := len(inflight)
@@ -398,6 +399,9 @@ func runLive(conn *websocket.Conn, st *connState, W int) string {
 			if isAck && f.Status != 0 { // 服务端显式拒收：计丢不计延（不进时延分位）
 				atomic.AddInt64(&rejected, 1)
 				atomic.AddInt64(&lost, 1)
+				L.Lock()
+				coolUntil = time.Now().Add(300 * time.Millisecond) // 冷却期停发，给准入闸减压
+				L.Unlock()
 			} else {
 				atomic.AddInt64(&echoOK, 1)
 				rttHist.record(time.Since(ts))
@@ -423,6 +427,10 @@ func runLive(conn *websocket.Conn, st *connState, W int) string {
 		// 补满在途窗口（conn 模式 W==0，循环体不进入，只发心跳）
 		for W > 0 {
 			L.Lock()
+			if time.Now().Before(coolUntil) {
+				L.Unlock()
+				break // 拒收冷却期：让出 wake 循环，到期后由下一次回执/定时器恢复
+			}
 			if len(inflight) >= W {
 				L.Unlock()
 				break

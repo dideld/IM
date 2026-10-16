@@ -2,6 +2,7 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -32,6 +33,14 @@ func kafkaConf(key, def string) string {
 	return def
 }
 
+// kafkaPartitions topic 分区数（缺省 1；>1 的前置条件是 Produce Key=convId 已生效）
+func kafkaPartitions() int {
+	if n := viper.GetInt("kafka.partitions"); n > 0 {
+		return n
+	}
+	return 1
+}
+
 // ensureTopic 启动时幂等确保 topic 存在。
 // 必须早于消费者启动：kafka-go 的 group 若在 topic 自动创建之前入组，
 // 会拿到空分区分配且此后不触发再均衡，消费者将永久静默不消费。
@@ -56,8 +65,10 @@ func ensureTopic(broker, topic string) {
 	defer cc.Close()
 
 	if err := cc.CreateTopics(kafka.TopicConfig{
-		Topic:             topic,
-		NumPartitions:     1,
+		Topic: topic,
+		// kafka.partitions 只影响"首次创建"（已存在 topic 改分区要手工 alter，练手期先给 1）。
+		// ⚠️ 扩分区必须与 Produce Key=convId 同时生效：无 Key 时同会话跨分区=多消费者并发 INCR seq=乱序。
+		NumPartitions:     kafkaPartitions(),
 		ReplicationFactor: 1,
 	}); err != nil && !strings.Contains(err.Error(), "already exists") {
 		Error(context.Background(), "Kafka ensureTopic 创建 topic 失败", "error", err)
@@ -86,30 +97,50 @@ func InitKafka() {
 	Info(context.Background(), "Kafka Producer (sync writer) Initialized", "broker", broker, "topic", topic)
 }
 
-// Produce 同步投递一条消息到 chat_messages。
+// KafkaMsg 对外暴露 kafka.Message 别名（models 层携带 Partition/Offset 移交提交权，无需直接依赖 kafka-go）
+type KafkaMsg = kafka.Message
+
+// ErrCommitDeferred handler 返回此哨兵：本条消息的落库/提交责任已移交冷 writer（batch 档流水线），
+// 消费者立即继续 fetch——这是"拆 rec.done 同步等待"的协议面。
+var ErrCommitDeferred = errors.New("commit deferred to cold writer")
+
+// Produce 同步投递一条消息到 chat_messages。**Key=convId 是硬约定**：
+// 同一会话的消息恒落同一分区，才允许多分区下"每会话单消费者"的 seq 发号前提。
 // 返回非 nil 即"broker 未收下"，调用方必须走重投/失败回执，绝不静默丢弃。
-func Produce(msgData []byte) error {
+func Produce(msgData []byte, key string) error {
 	if KafkaWriter == nil {
 		return fmt.Errorf("kafka writer not initialized")
 	}
 	return KafkaWriter.WriteMessages(context.Background(),
 		kafka.Message{
+			Key:   []byte(key),
 			Value: msgData,
 		},
 	)
 }
 
+// CommitKafka 允许冷 writer 在 flush 后跨协程提交 offset（group reader 的 offsets store 内部互斥，安全）。
+// 批处理严格 FIFO ⇒ 提交进度天然是已处理前缀，不会越过未完成消息。
+func CommitKafka(msgs ...KafkaMsg) error {
+	if kafkaReader == nil {
+		return fmt.Errorf("kafka reader not initialized")
+	}
+	return kafkaReader.CommitMessages(context.Background(), msgs...)
+}
+
 // SendMsgToKafka 兼容旧调用点的薄封装（忽略错误=仅限"无需回执"的旁路流量使用）
-func SendMsgToKafka(msgData []byte) {
-	if err := Produce(msgData); err != nil {
+func SendMsgToKafka(msgData []byte, key string) {
+	if err := Produce(msgData, key); err != nil {
 		Fatal(context.Background(), "Kafka 投递失败", "error", err)
 	}
 }
 
-// StartKafkaConsumer 启动消费者负责排队落盘 Redis。
-// 手动提交（at-least-once）：handler 返回 nil 才 commit offset；返回 error 不提交、退避后由 Kafka 重投。
-// handler 内部负责自身的有界重试/死信/失败 ACK，避免毒消息无限占住分区。
-func StartKafkaConsumer(consumeHandler func([]byte) error) {
+// StartKafkaConsumer 启动消费者。提交协议（at-least-once，两种归宿）：
+//   - handler 返回 nil               → 消费者提交（inline 档：落库+分发已在本调用内完成）；
+//   - handler 返回 ErrCommitDeferred → 不提交、静默继续（batch 档：责任随 kafka.Message 移交冷 writer）；
+//   - handler 返回其他 error         → 不提交、退避后继续（崩溃/停机时未提交 offset 由重放兜底）。
+// 移交后消费者**不再等待落盘完成**——吞吐与冷写节拍解耦（原 rec.done 同步等待是全链串行瓶颈）。
+func StartKafkaConsumer(consumeHandler func(KafkaMsg) error) {
 	kafkaQuit = make(chan struct{})
 	kafkaOnce = sync.Once{}
 	kafkaConsumerDone = make(chan struct{})
@@ -146,10 +177,11 @@ func StartKafkaConsumer(consumeHandler func([]byte) error) {
 				time.Sleep(3 * time.Second) // 避雷：没开 kafka 时防死循环暴搜
 				continue
 			}
-			// 落库+分发+ACK 全部完成（handler 返回 nil）才提交 offset；
-			// 返回 error 不提交，退避后 Kafka 重投（at-least-once，幂等由 handler 内部保证）
-			if err := consumeHandler(m.Value); err != nil {
-				log.Println("consume handler failed, offset 不提交, 1s 后重投:", err)
+			if err := consumeHandler(m); err != nil {
+				if errors.Is(err, ErrCommitDeferred) {
+					continue // 提交权已移交，静默前进
+				}
+				log.Println("consume handler failed, offset 不提交, 1s 后继续:", err)
 				select {
 				case <-time.After(time.Second):
 				case <-kafkaQuit:
@@ -167,8 +199,11 @@ func StartKafkaConsumer(consumeHandler func([]byte) error) {
 // KafkaStopping 停机信号（模型层入队前检查：停摆等待中收到信号则放弃入队、offset 不提交走重放）
 func KafkaStopping() bool { return kafkaStopping.Load() }
 
-// StopKafkaConsumer 停机第一步：发信号并等待消费者协程真正退出（≤10s），再关 reader。
-// 只有确认无人再向 coldCh 入队，StopColdWriter 的"排空"才是可终结的。
+// KafkaQuitChan 消费者停机通道（models 聚合器 select 退出用；未启动时为 nil——select nil 通道永不就绪，安全）
+func KafkaQuitChan() <-chan struct{} { return kafkaQuit }
+
+// StopKafkaConsumer 停机第一步：发信号并等待消费者协程真正退出（≤10s）。
+// **不关 reader**——冷 writer 在排空期还要跨协程 CommitKafka；reader 由最后的 CloseKafka 关闭。
 func StopKafkaConsumer() {
 	if kafkaQuit == nil {
 		return
@@ -182,13 +217,14 @@ func StopKafkaConsumer() {
 			Warn(context.Background(), "Kafka 消费者退出超时，强制继续停机")
 		}
 	}
+}
+
+// CloseKafka 停机最后一步：关 reader 与 writer。
+// 必须在 StopColdWriter 之后——冷 writer 的 flush 提交要活着 reader（见 A7 三步定序）。
+func CloseKafka() {
 	if kafkaReader != nil {
 		kafkaReader.Close()
 	}
-}
-
-// CloseKafkaProducer 停机最后一步：关生产者（须在冷 writer 排空之后——收尾期的分发/ACK 不再产生新投递需求）
-func CloseKafkaProducer() {
 	if KafkaWriter != nil {
 		KafkaWriter.Close()
 	}
