@@ -9,6 +9,7 @@ package models
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,10 +56,15 @@ func landAndDeliver(recs []landedRecord) error {
 	ctx := context.Background()
 	hotKeep := int64(cfgInt("storage.hotKeep", 200))
 	ttl := time.Duration(cfgInt("storage.hotTTLDays", 7)) * 24 * time.Hour
+	thr := groupPushThreshold()
 
-	// 群成员表按会话取一次（g_members 缓存，singleflight 保护）；据此规划每个 rec 的收件人
+	// 群成员表按会话取一次（g_members 缓存，singleflight 保护）；据此规划每个 rec 的收件人与模式。
+	// 大群（成员数>阈值）：不逐员 HINCRBY（未读改 seq−游标计算式），且不发"原文+Type4"两帧——
+	// 合并为一帧 Type=7（内容+权威未读一帧两用），在线扇出与 Redis 写都减半以上；
+	// 纯事件+客户端拉取的进一步降级见 README 待办。
 	membersOf := make(map[string][]int64, 4)
 	targets := make([][]int64, len(recs))
+	bigConv := make(map[string]bool, 2)
 	for i := range recs {
 		rec := &recs[i]
 		sender := int64(rec.parsed.UserId)
@@ -70,6 +76,9 @@ func landAndDeliver(recs []landedRecord) error {
 					m = []int64{}
 				}
 				membersOf[rec.convId] = m
+			}
+			if len(m) > thr {
+				bigConv[rec.convId] = true
 			}
 			for _, uid := range m {
 				if uid != sender {
@@ -85,13 +94,22 @@ func landAndDeliver(recs []landedRecord) error {
 		uid   int64
 		recIx int
 	}
+	type curReq struct {
+		uid   int64
+		conv  string
+		recIx int
+	}
 	var incrs []*redis.IntCmd
 	var metas []incrReq
+	var curs []*redis.StringCmd
+	var curMetas []curReq
 	var execErr error
 	// 重试必须重建 pipeline（已 Exec 的 Cmd 不可复用），封成闭包
 	run := func() error {
 		incrs = incrs[:0]
 		metas = metas[:0]
+		curs = curs[:0]
+		curMetas = curMetas[:0]
 		pipe := utils.Red.Pipeline()
 		for i := range recs {
 			pipe.ZAdd(ctx, recs[i].convId, redis.Z{Score: float64(recs[i].seq), Member: recs[i].raw})
@@ -108,13 +126,26 @@ func landAndDeliver(recs []landedRecord) error {
 			}
 		}
 		for i := range recs {
+			if bigConv[recs[i].convId] {
+				// 大群：只取各成员已读游标（unread = seq − cursor），不写 unread HASH
+				for _, uid := range targets[i] {
+					curs = append(curs, pipe.Get(ctx, readKeyPrefix+strconv.FormatInt(uid, 10)+":"+recs[i].convId))
+					curMetas = append(curMetas, curReq{uid: uid, conv: recs[i].convId, recIx: i})
+				}
+				continue
+			}
 			for _, uid := range targets[i] {
 				incrs = append(incrs, pipe.HIncrBy(ctx, unreadKeyPrefix+strconv.FormatInt(uid, 10), recs[i].convId, 1))
 				metas = append(metas, incrReq{uid: uid, recIx: i})
 			}
 		}
 		_, err := pipe.Exec(ctx)
-		return err
+		// go-redis pipeline 的 Exec 会把组内第一个命令级错误（如游标 GET 未命中的 redis.Nil）
+		// 打包返回——这不是管道故障，逐 cmd 结果里已正确处理，不能误判为整批失败触发回滚
+		if err != nil && !errors.Is(err, redis.Nil) {
+			return err
+		}
+		return nil
 	}
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
@@ -129,34 +160,71 @@ func landAndDeliver(recs []landedRecord) error {
 	}
 
 	// —— exec 成功后才扇出（内存路径，无失败回滚需求）——
+	// 1) 普通消息原文扇出（大群原文并入 Type=7 合并帧，不单独发）
 	for i := range recs {
-		rec := &recs[i]
+		if bigConv[recs[i].convId] {
+			continue
+		}
 		for _, uid := range targets[i] {
-			deliverLocal(uid, rec.raw)
+			deliverLocal(uid, recs[i].raw)
 		}
 	}
-	previewOf := make([]string, len(recs))
-	for i := range recs {
-		previewOf[i] = mediaPreview(recs[i].parsed)
+	// 2) 未读事件按 (uid,conv) 聚合：一批内同一收件人同会话多条消息 → 只发最后一条的终值一帧
+	//    （metas 按 recs 顺序即 seq 升序遍历，覆盖记录天然留最后/最大值）
+	type evtKey struct {
+		uid  int64
+		conv string
 	}
+	last := make(map[evtKey]int, len(metas))
 	for k, meta := range metas {
+		last[evtKey{meta.uid, recs[meta.recIx].convId}] = k
+	}
+	for key, k := range last {
+		meta := metas[k]
 		n, err := incrs[k].Result()
 		if err != nil {
 			utils.Error(ctx, "unread HIncrBy 结果异常", "uid", meta.uid, "error", err)
 			continue
 		}
 		rec := &recs[meta.recIx]
-		evt, err := json.Marshal(map[string]interface{}{"Type": 4, "ConvId": rec.convId, "Seq": rec.seq, "Unread": n})
+		evt, err := json.Marshal(map[string]interface{}{"Type": 4, "ConvId": key.conv, "Seq": rec.seq, "Unread": n})
 		if err == nil {
 			deliverLocal(meta.uid, evt)
 		}
 		if pushEnabled() && !WsHub.HasOnline(meta.uid) {
 			utils.OfflinePush(meta.uid, utils.PushSummary{
-				ConvId: rec.convId, Seq: rec.seq, MsgId: rec.msgId,
-				Sender: int64(rec.parsed.UserId), MsgType: rec.parsed.Type, Preview: previewOf[meta.recIx],
+				ConvId: key.conv, Seq: rec.seq, MsgId: rec.msgId,
+				Sender: int64(rec.parsed.UserId), MsgType: rec.parsed.Type, Preview: mediaPreview(rec.parsed),
 			})
 		}
 	}
+	// 3) 大群合并帧 Type=7：{内容, Seq, Unread=seq−cursor}
+	for k, cm := range curMetas {
+		cur, err := curs[k].Int64()
+		if err != nil {
+			cur = 0 // nil（从未 markRead）或其它错误都按 0 处理：全未读
+		}
+		rec := &recs[cm.recIx]
+		unread := rec.seq - cur
+		if unread < 0 {
+			unread = 0
+		}
+		frame, err := json.Marshal(map[string]interface{}{
+			"Type": 7, "ConvId": cm.conv, "Seq": rec.seq, "Unread": unread,
+			"Msg": json.RawMessage(rec.raw),
+		})
+		if err != nil {
+			continue
+		}
+		deliverLocal(cm.uid, frame)
+		if pushEnabled() && !WsHub.HasOnline(cm.uid) {
+			utils.OfflinePush(cm.uid, utils.PushSummary{
+				ConvId: cm.conv, Seq: rec.seq, MsgId: rec.msgId,
+				Sender: int64(rec.parsed.UserId), MsgType: rec.parsed.Type, Preview: mediaPreview(rec.parsed),
+			})
+		}
+	}
+	// 4) 发送者 ACK（与目标模式无关）
 	for i := range recs {
 		rec := &recs[i]
 		ackTo(int64(rec.parsed.UserId), rec.clientMsgId, rec.convId, rec.seq, rec.msgId, 0, "")
@@ -166,6 +234,14 @@ func landAndDeliver(recs []landedRecord) error {
 		trimCmSet(cid, hotKeep)
 	}
 	return nil
+}
+
+// groupPushThreshold 大群判定阈值（成员数超过即走合并帧/计算式未读）
+func groupPushThreshold() int {
+	if n := viper.GetInt("push.groupPushMaxMembers"); n > 0 {
+		return n
+	}
+	return 200
 }
 
 // convGid "g_{群id}" → 群 id（解析失败返回 0）

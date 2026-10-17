@@ -15,6 +15,7 @@ package models
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -225,7 +226,7 @@ func aggregateBatch(batch []utils.KafkaMsg) bool {
 		}
 		if len(need) > 0 {
 			cmds, err := pipe2.Exec(ctx)
-			if err != nil {
+			if err != nil && !errors.Is(err, redis.Nil) {
 				utils.Error(ctx, "门禁 HGet pipeline 失败(停摆重试)", "error", err)
 				return false
 			}

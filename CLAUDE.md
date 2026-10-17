@@ -46,7 +46,8 @@ main.go → router/app.go（路由注册）→ service/*（HTTP controller，Swa
    - **消费（聚合器批处理，批内 Redis 合并）**：utils 消费者 `FetchMessage` → `consumeCh` → **聚合器**（`storage.aggregateWindowMs` 2ms / `aggregateMax` 500 攒批）：批内 ①分类丢弃（无效帧/非业务/压测旁路，offset 随 unit 提交不卡分区）+ 本地 (conv|cmid) 去重；②门禁 HSetNX "P" **一批一 Pipeline**，未创建者二次 HGet 分类（终值→重放补 ACK 不落库；"P"→上次半途继续落库）；③每会话 **INCRBY n** 批量发号，按到达序分配 end-n+1..end（gated 保持原序——乱序=seq 错位，实现用 status 数组回填）；④组 `coldUnit{recs, commitTo=全部输入消息}` 入 `coldCh`(unit 通道，满=停摆【警告】背压)。Redis 失败=停摆重试不丢不越序；停机=放弃未处理批（未提交靠重放）。
    - **冷 writer（唯一落库/投递/提交路径；inline=unit1 特例，同一代码）**：攒够 coldBatchSize/超时 → **`splitAlreadyLanded` 落库前幂等对账**（①同 flush 跨 unit 的批内副本 seen 去重静默丢弃；②DB 已有 (conv,cmid) 行的副本转"重放"——回补原 seq/msgId 的 ACK，不占热层不重计未读）→ 全新者 CreateInBatches → 成功则 **`landAndDeliver` 单 Pipeline 合并：热层 ZAdd(全员) + 按会话修剪/续期 + 门禁终值 HSet + 未读 HINcrBy(全员)** → exec 成功后才纯内存扇出（消息原文 → Type=4 事件(带权威计数) → 发送者 ACK-0）→ `commitFrom(本组全部输入 offset)`；任一硬失败 → `failLanded` 收口（清标记+死信+ACK-1，热层若半写以 ZRem 清理）后**照常提交**（毒消息不占分区）。批级 panic recover 整批收口，writer 循环绝不静默死亡。
    - **门禁时序新语义（重要）**："P" 占位在聚合器、**终值 "seq:msgId" 挪到冷层成功后**与热层同 Pipeline 写——终值存在即"确已落库并投递"；崩溃窗口内重放见 "P" 继续落库，由 `uk_conv_cmid/uk_conv_seq + DoNothing` 幂等兜底（冲突【警告】可能因合法重放出现，非必为撞号）。at-least-once 与"冷层成功前不投递"两条不变量不变。
-   - **放大分发**（`deliverLanded`，models/deliver.go）：私聊投目标（给自己发不积未读）；群聊按 `g_members` 缓存逐成员扇出（排除发送者）；随后 `pushUnread`（未读 + Type=4，`push.enabled` 时对无在线设备者走 OfflinePush 挂点）；最后回发送者 **Type=6 ACK（Status 0，带 Seq/MsgId）**。
+   - **放大分发与未读合并**（`landAndDeliver`，models/deliver.go）：exec 成功后纯内存扇出。普通会话按 (uid,conv) **聚合未读事件**——一批多条只发最后一个 seq 的一帧 Type=4（带权威计数），原文逐条照发；**大群（成员数 > `push.groupPushMaxMembers` 缺省 200）走推拉结合第一步**：不发原文、不逐员 HINCRBY，每成员一帧 **Type=7 合并帧 `{ConvId,Seq,Unread=seq−游标,Msg:内嵌原文}`**，未读改**计算式**（`unreadList`/UnreadMap 对大群同口径合并 `seq:{conv} − read 游标`，markRead 只前移游标）。最后回发送者 Type=6 ACK（Status 0，带 Seq/MsgId）。
+   - **Pipeline 错误语义（大坑教训）**：go-redis `pipe.Exec` 会把组内**命令级 redis.Nil**（游标 GET miss、门禁 HGet miss）打包成整体 error 返回——这不是管道故障，忽略 `errors.Is(err, redis.Nil)` 后逐 cmd 处理，否则误触发整批 failRecs 回滚（首测就炸在这）。
    - **新不变量：冷层写成功前不得投递；分发+ACK 完成前不得提交 offset**。失败收口在 persistMessage 内有界完成（清去重标记 + `msg:dlq` 死信留证 + 错误 ACK-1，然后照常提交，毒消息不占分区）。系统提示语（欢迎语）仍走 `deliverLocal`（仅内存、不落库不回 ACK）。代价：消息可见时延 +Kafka 往返+攒批（`coldFlushMs` 缺省 50ms）；收益：Kafka/MySQL 故障不再"假送达"，崩溃恢复靠 offset 重放。
 
 ### 鉴权会话（`utils/auth.go`，P0 新增）
@@ -88,14 +89,14 @@ main.go → router/app.go（路由注册）→ service/*（HTTP controller，Swa
 
 刻意做成 **53 bit**（41 时间戳 + 5 机器码 + 7 序列），以同时兼容 JS `Number.MAX_SAFE_INTEGER` 和 Redis ZSet 的 float64 score。**不要拓宽任何一段位数的占比**，否则前端精度丢失、ZSet score 碰撞。
 
-- `main.go` 显式 `InitSnowflake(viper.GetInt64("snowflake.workerId"))`（0~31）。**多实例部署必须逐实例配置不同 workerId**，否则同毫秒撞 ID → 冷存主键冲突被跳过（cold writer 的【警告】日志就是抓这个的；workerId 的 Redis 租约互斥为"待办-多实例"项）。**时钟回拨防御**：≤2s 有界自旋+告警，更大回拨"借时不回头"（沿用 lastTs 推序列保 ID 单调），不长自旋不 panic。seq 双轨：排序/游标/未读用 seq，msgId（雪花）是冷层主键与全局唯一标识；投递幂等由 clientMsgId（P2）承担。
+- `main.go` 显式 `InitSnowflake(viper.GetInt64("snowflake.workerId"))`（0~31）。**多实例部署必须逐实例配置不同 workerId**，否则同毫秒撞 ID → 冷存主键冲突被跳过（cold writer 的【警告】日志就是抓这个的；workerId 的 Redis 租约互斥为"待办-多实例"项）。**时钟回拨防御**：≤2s 有界自旋+告警，更大回拨"借时不回头"（沿用 lastTs 推序列保 ID 单调），不长自旋不 panic。**序列溢出换纪元**：每毫秒 128 个用完后必须重置 number=0 并推进 timestamp——否则 number=128 溢出进 worker 位段，ID 位模式与"workerId+1 的 0 号"雷同（多实例即撞号炸弹；已修，240 万并发无重复回归过）。冷层冲突现在有 `probeConflicts` 取证日志，直接指明撞的是序号复用/重放/PK 哪一类。seq 双轨：排序/游标/未读用 seq，msgId（雪花）是冷层主键与全局唯一标识；投递幂等由 clientMsgId（P2）承担。
 
 ### 数据模型约定
 
 - 所有表用 `gorm.Model`（软删除 `deleted_at`），启动时 `models.Migrate()` AutoMigrate 同步结构，建表脚本 `sql/init_ginchat.sql` 是快照（其中 message 段含 DROP 重建，见下）。
 - `message` 表为冷存储全量归档：主键 id 显式写入雪花 ID（非自增），另有 `seq`（会话内递增号）与 `conv_key`，`(conv_key, seq)` 复合唯一。旧 DDL（form_id/target_id longtext）与新结构不兼容，开发库需先 `DROP TABLE message;` 一次。
 - `Contact.Type`：1=好友（**双向各存一行**，增删须成对处理，见 `AddFriend`/`DeleteFriend`），2=群成员关系（owner_id=用户，target_id=群）。
-- `Message.Type`：1 私聊 / 2 群聊 / 3 心跳 / 4 未读事件 / 5 已读回执 / 6 发送确认(ACK)（**4、5、6 仅服务端→客户端**，客户端若回发会因 dispatchTo 无匹配分支被无害忽略；4/5/6 事件无 clientMsgId 关联，前端务必先拦截）；`Media`：文字、表情、图片、音频；`Amount`（原拼写错误字段 `Amoubt` 已改名，改后前端 `amount` JSON 才真正绑定得上）；`ReadCount`：群聊逐条已读计数（MarkRead 窗口逐条 +1，见"未读、已读与回执"）；`ClientMsgId`：客户端幂等键兼 ACK 关联键（`genMsgId()` 生成，业务消息缺失即被结构校验拒绝）。
+- `Message.Type`：1 私聊 / 2 群聊 / 3 心跳 / 4 未读事件 / 5 已读回执 / 6 发送确认(ACK) / 7 大群合并帧(内容+计算式未读一帧两用)（**4/5/6/7 仅服务端→客户端**，客户端回发会因 dispatchTo 无匹配分支被无害忽略；前端 `onmessage` 必须按 Type 白名单先行拦截）；`Media`：文字、表情、图片、音频；`Amount`（原拼写错误字段 `Amoubt` 已改名，改后前端 `amount` JSON 才真正绑定得上）；`ReadCount`：群聊逐条已读计数（MarkRead 窗口逐条 +1，见"未读、已读与回执"）；`ClientMsgId`：客户端幂等键兼 ACK 关联键（`genMsgId()` 生成，业务消息缺失即被结构校验拒绝）。
 - `user_read_cursor` 表：`(user_id, conv_key)` 唯一，`last_seq` 为已读水位——Redis `read:` 游标的持久账本。
 
 ### 已清理的遗留路径

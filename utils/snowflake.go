@@ -80,6 +80,9 @@ func GenSnowflakeId() int64 {
 			for now <= sfWorker.timestamp {
 				now = time.Now().UnixNano() / 1e6
 			}
+			// 必须换纪元重置：否则 number 携带 128 溢出进 worker 位段（ID 位模式与 "workerId+1 的 0 号 ID" 雷同，多实例部署下就是撞号炸弹）
+			sfWorker.timestamp = now
+			sfWorker.number = 0
 		}
 	} else {
 		sfWorker.number = 0

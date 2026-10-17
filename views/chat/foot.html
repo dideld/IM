@@ -642,6 +642,17 @@
                     }
                 },
                 onmessage: function (data) {
+                    if (data.Type === 7) {
+                        //大群合并帧(内容+权威未读一帧两用)：正开当前会话即收即读并渲染，否则只刷角标
+                        if (data.ConvId === this.currentConvId()) {
+                            var vm = this
+                            this.loaduserinfo(data.Msg.userId, function (user) { vm.showmsg(user, data.Msg) })
+                            this.markRead(data.ConvId)
+                        } else if (data.Unread > 0) {
+                            Vue.set(this.unread, data.ConvId, data.Unread)
+                        }
+                        return
+                    }
                     if (data.Type === 6) {
                         //服务端发送确认(仅服务端→客户端)：按 clientMsgId 定气泡状态，绝不进 msglist
                         this.ackMsg(data)

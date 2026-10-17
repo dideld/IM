@@ -86,6 +86,20 @@
 
 **残留边缘（如实记录，未修完）**：mq6 终验仍有 ~0.2% 唯一冲突告警伴生**无害 seq 洞**（丢的只有编号，非数据：行层无重复无缺失、LAG 0、丢包 0）。疑点收敛到雪花"借时"分支跨 unit 边界与启动回放交叠，需要专项复现（构造时钟回拨+副本注入）。影响评级：仅游标美观/告警噪音，无正确性损伤；列入待办。
 
+## P4 轮（2026-10-16）：大群推拉第一步 + 批内未读聚合 + 三处实测修复
+
+| 变更 | 说明 | 验证 |
+|---|---|---|
+| **③ 批内未读事件聚合** | landAndDeliver 按 (uid,conv) 只发最后 seq 的一帧 Type=4（一批 3 条私聊 → 3 原文 + 1 事件，Unread=3 权威值） | ✅ 实测 |
+| **② 大群推拉（第一步）** | `push.groupPushMaxMembers`（缺省 200）以上：不 HINCRBY、不发原文，每成员一帧 **Type=7 合并帧**（内容+`Unread=seq−游标` 一帧两用）；`UnreadMap` 大群同口径计算式合并；markRead 只前移游标即收敛 | ✅ 实测 9/9：Type=7 到帧、unreadList 计算式 1→markRead 清零→游标/read_count 全对 |
+| **① seq 洞专项** | 修掉雪花**序列溢出未换纪元**缺陷（number=128 溢进 worker 位段）；冷层冲突新增 `probeConflicts` 取证（序号复用/合法重放/PK 撞号一眼定性和样本）。mq6 轮 0.2% 洞的成因清单收敛到取证日志，下次复现一步定案 | ✅ 8×30 万并发无重复 + worker 位段纯净 |
+| **pipeline redis.Nil 误判**（实测炸点） | go-redis `pipe.Exec` 把组内命令级 `redis.Nil`（游标 GET 首读必 miss、门禁 HGet 竞态 miss）打包成整体 error → 误触发整批 failRecs+热层回滚。三处统一 `errors.Is(err, redis.Nil)` 忽略、按 cmd 处理 | ✅ 修复前 5 FAIL → 修复后全绿 |
+| **compose restart 策略** | always → **unless-stopped**：手动 stop 的容器不再随守护进程复活抢 8081（本轮两次被旧镜像容器"顶班"坑） | ✅ 复现并规避 |
+
+**测试工装教训（非产品问题但值记录）**：gorilla 读超时即弃连接（collect 两轮之间必须换新连接）；验证进程与被测服务必须同一 MYSQL_DNS env（默认 yml 连原生库，查询"查错库"制造 3 个假 FAIL）。
+
+**下一步待办不变**：纯事件+客户端拉取的大群降级（Type=7 已带内容，属半程）、群逐条 Type=5 全员精确、workerId 租约（多实例前）、seq 洞取证闭环（probeConflicts 已就位）。
+
 ## 验证结果（运行时验收，全部通过）
 
 环境：compose redis/kafka/mysql + 原生服务端注入 `TIMEOUT_DELAYHEARTBEAT=8 HUB_MAXDEVICES=2`，真实 token 全链路（不开 dev 跳鉴权）。

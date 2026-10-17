@@ -50,6 +50,7 @@ storage:
 push:
   enabled: false
   debug: false
+  groupPushMaxMembers: 200   # 大群阈值：成员数超过即走 Type=7 合并帧 + seq−游标 计算式未读
 
 # ---- 会话鉴权 ----
 auth:

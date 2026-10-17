@@ -16,11 +16,13 @@ package models
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
 	"webapp/utils"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/spf13/viper"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -303,17 +305,53 @@ func PeerReadSeq(convId string, uid int64) int64 {
 	return getReadCursor(peer, convId)
 }
 
-// UnreadMap 返回 {convId: 未读数}，无数据返回空 map
+// UnreadMap 返回 {convId: 未读数}，无数据返回空 map。
+// 大群（成员数超阈值）未读不走 unread HASH（landAndDeliver 计算式路径），这里同口径合并：
+// unread = seq:{conv} − read 游标。
 func UnreadMap(userId int64) map[string]int64 {
 	out := map[string]int64{}
-	m, err := utils.Red.HGetAll(context.Background(), unreadKeyPrefix+strconv.FormatInt(userId, 10)).Result()
+	ctx := context.Background()
+	m, err := utils.Red.HGetAll(ctx, unreadKeyPrefix+strconv.FormatInt(userId, 10)).Result()
 	if err != nil {
-		utils.Error(context.Background(), "UnreadMap error", "error", err)
+		utils.Error(ctx, "UnreadMap error", "error", err)
 		return out
 	}
 	for k, v := range m {
 		if n, e := strconv.ParseInt(v, 10, 64); e == nil && n > 0 {
 			out[k] = n
+		}
+	}
+	// 大群计算式
+	var gids []uint
+	utils.DB.Model(&Contact{}).Where("owner_id = ? AND type = 2", userId).Pluck("target_id", &gids)
+	thr := groupPushThreshold()
+	type bigGC struct {
+		conv string
+	}
+	var bigs []bigGC
+	pipe := utils.Red.Pipeline()
+	for _, gid := range gids {
+		if len(GroupMembers(gid)) <= thr {
+			continue
+		}
+		conv := "g_" + strconv.FormatUint(uint64(gid), 10)
+		pipe.Get(ctx, seqKeyPrefix+conv)
+		pipe.Get(ctx, readKeyPrefix+strconv.FormatInt(userId, 10)+":"+conv)
+		bigs = append(bigs, bigGC{conv})
+	}
+	if len(bigs) > 0 {
+		cmds, err := pipe.Exec(ctx)
+		if err == nil || errors.Is(err, redis.Nil) { // 组内游标 GET 未命中的 redis.Nil 不算管道故障
+			for i, b := range bigs {
+				seq, e1 := cmds[i*2].(*redis.StringCmd).Int64()
+				cur, e2 := cmds[i*2+1].(*redis.StringCmd).Int64()
+				if e2 != nil {
+					cur = 0 // 无游标 = 全未读
+				}
+				if e1 == nil && seq-cur > 0 {
+					out[b.conv] = seq - cur
+				}
+			}
 		}
 	}
 	return out
@@ -515,12 +553,90 @@ func coldInsertRetry(batch []landedRecord) error {
 				// 冲突跳过的行要大声告警：workerId 撞号（不同消息同 ID）与 Redis 丢失后的重放（同 clientMsgId）都会到这里
 				utils.Warn(context.Background(), "冷存储唯一冲突被跳过：排查多实例 snowflake.workerId 重复，或 Redis 丢失后 Kafka 重放（由 uk_conv_cmid 拦截）",
 					"conflict_count", int64(len(msgs))-r.RowsAffected, "batch_size", len(msgs))
+				probeConflicts(msgs) // 罕见路径取证：判别下一条冲突到底撞的是哪个键
 			}
 			return nil
 		}
 	}
 	utils.Error(context.Background(), "cold persist MySQL batch failed", "size", len(batch), "error", err)
 	return err
+}
+
+// probeConflicts 冲突定性取证（打印最多 2 条样本）：
+//   同 (conv,seq) 且 cmid 不同   = 序号复用（聚合器发号缺陷，P0 级要修）
+//   同 (conv,cmid) 且 seq 不同   = 合法重放漏检（崩溃/门禁窗口，B4 设计内兜底，无害）
+//   seq/cmid 皆同（本批行已在库） = 冷写重试自撞（上次 attempt 已应用超时）
+//   都查不到而 RowsAffected 少    = PK msgId 位段冲突（workerId/借时/溢出问题，查雪花）
+func probeConflicts(msgs []Message) {
+	ctx := context.Background()
+	type row struct {
+		ConvKey     string
+		Seq         int64
+		ClientMsgId string `gorm:"column:client_msg_id"`
+		ID          uint
+	}
+	convs := make([]string, 0, 4)
+	seqs := make([]int64, 0, len(msgs))
+	cmids := make([]string, 0, len(msgs))
+	seenConv := make(map[string]bool)
+	for i := range msgs {
+		m := &msgs[i]
+		if !seenConv[m.ConvKey] {
+			seenConv[m.ConvKey] = true
+			convs = append(convs, m.ConvKey)
+		}
+		seqs = append(seqs, m.Seq)
+		if m.ClientMsgId != "" {
+			cmids = append(cmids, m.ClientMsgId)
+		}
+	}
+	if len(convs) == 0 {
+		return
+	}
+	var rows []row
+	q := utils.DB.Table("message").Select("conv_key, seq, client_msg_id, id").Where("conv_key IN (?)", convs)
+	or := "(seq IN (?)"
+	args := []interface{}{seqs}
+	if len(cmids) > 0 {
+		or += " OR client_msg_id IN (?)"
+		args = append(args, cmids)
+	}
+	q = q.Where(or+")", args...)
+	if err := q.Limit(2000).Find(&rows).Error; err != nil {
+		utils.Error(ctx, "冲突取证查询失败", "error", err)
+		return
+	}
+	bySeq := make(map[string]row, len(rows))
+	byCm := make(map[string]row, len(rows))
+	for _, r := range rows {
+		bySeq[r.ConvKey+"|"+strconv.FormatInt(r.Seq, 10)] = r
+		if r.ClientMsgId != "" {
+			byCm[r.ConvKey+"|"+r.ClientMsgId] = r
+		}
+	}
+	reported := 0
+	for i := range msgs {
+		m := &msgs[i]
+		sHit, sOk := bySeq[m.ConvKey+"|"+strconv.FormatInt(m.Seq, 10)]
+		cHit, cOk := byCm[m.ConvKey+"|"+m.ClientMsgId]
+		switch {
+		case sOk && cOk && sHit.ID == m.ID && cHit.ID == m.ID:
+			utils.Warn(ctx, "冲突样本：冷写重试自撞（上次 attempt 已应用）", "conv", m.ConvKey, "seq", m.Seq, "cmid", m.ClientMsgId)
+		case sOk && sHit.ClientMsgId != m.ClientMsgId:
+			utils.Error(ctx, "冲突样本：序号复用！聚合器发号缺陷（P0）", "conv", m.ConvKey, "seq", m.Seq,
+				"occupant", sHit.ClientMsgId, "victim", m.ClientMsgId, "victim_msgid", m.ID)
+		case cOk && cHit.Seq != m.Seq:
+			utils.Warn(ctx, "冲突样本：合法重放（门禁窗口副本，B4 兜底）", "conv", m.ConvKey, "cmid", m.ClientMsgId,
+				"db_seq", cHit.Seq, "dup_seq", m.Seq)
+		case !sOk && !cOk:
+			utils.Error(ctx, "冲突样本：PK msgId 冲突（查雪花 worker 位段/借时）", "conv", m.ConvKey, "seq", m.Seq, "msgid", m.ID)
+		default:
+			continue
+		}
+		if reported++; reported >= 2 {
+			return
+		}
+	}
 }
 
 // commitFrom 把已 flush 组的全部输入消息（含被丢弃/重放帧——它们的 offset 也必须提交，毒消息不占分区）
