@@ -145,9 +145,14 @@ func (tw *TimeWheel) removeTask(key interface{}) {
 }
 
 func (tw *TimeWheel) getPosAndCircle(d time.Duration) (pos int, circle int) {
-	delaySeconds := int(d.Seconds())
-	intervalSeconds := int(tw.interval.Seconds())
-	circle = delaySeconds / intervalSeconds / tw.slotNum
-	pos = (tw.currentPos + delaySeconds/intervalSeconds) % tw.slotNum
+	// 毫秒口径：interval < 1s 时秒整数除法会除零（原实现隐性要求 interval≥1s）；
+	// 换毫秒后亚秒级时间轮亦可用，1s 生产配置行为不变。
+	delayMs := d.Milliseconds()
+	intervalMs := tw.interval.Milliseconds()
+	if intervalMs <= 0 {
+		intervalMs = 1
+	}
+	circle = int(delayMs / intervalMs / int64(tw.slotNum))
+	pos = (tw.currentPos + int(delayMs/intervalMs)) % tw.slotNum
 	return
 }

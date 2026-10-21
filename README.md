@@ -18,7 +18,7 @@
 ### 依赖
 
 - **一键全栈（推荐，零本地依赖）**：`docker-compose up -d --build` 一次拉起 MySQL(自动建库+初始SQL) + Redis + Kafka(KRaft) + go_app + Nginx；打开 `http://localhost/` 注册即用。数据在命名卷（`mysql_data`/`app_upload`），`docker-compose down -v` 整体重置。
-- 手动模式（宿主机 `go run .` 调试用）：自备 MySQL/Redis/Kafka——本机已有原生 MySQL 时，compose 里中间件**不发布宿主端口**，两者可共存。
+- 手动模式（宿主机 `go run .` 调试用）：自备 MySQL/Redis/Kafka，或复用 compose 里的——中间件端口只绑 127.0.0.1 且 MySQL 映射 **13306**（避开宿主机原生 3306 实例共存），宿主机直跑用 env 注入：`REDIS_ADDR=127.0.0.1:6379 KAFKA_BROKER=127.0.0.1:9092 MYSQL_DNS="root:…@tcp(127.0.0.1:13306)/ginchat?…"`。
 - 配置优先级：**环境变量 > `config/app.yml`**（viper AutomaticEnv：`mysql.dns`→`MYSQL_DNS`、`redis.addr`→`REDIS_ADDR`、`kafka.broker`→`KAFKA_BROKER`、`port.server`→`PORT_SERVER`、`upload.path`→`UPLOAD_PATH`）。compose 靠 env 指向容器服务名，宿主机直跑不用改文件。
 - 注意：`host.docker.internal` 只在容器内可靠指向宿主机；宿主机直连失败（`no such host`/握手被掐）时改用 env `REDIS_ADDR=127.0.0.1:6379` 等，别改提交文件。
 - 多实例部署：为每个实例配置不同的 `snowflake.workerId`（0~31）
@@ -32,6 +32,8 @@ go run test/bench_ws.go -mode echo -clients 5000 -wind 4   # WS 压测 v3（echo
 ```
 
 浏览器访问 `http://localhost/`（compose）或 `http://localhost:8081/` 注册登录。
+
+compose 需要 `.env`（新 clone 没有会直接起不来）：先 `copy .env.example .env`（Linux/macOS 用 `cp`），按需改密码。
 
 ## 架构总览
 
@@ -150,6 +152,26 @@ test/          bench_ws.go 压测     docs/  swag 生成物
 **容量估算**：内存 ≈ 连接数×(读写缓冲 8KB×2 + DataQueue 最坏 1024×消息均值) + 热层 Σ(会话数×hotKeep×消息大小)；注意 workerId 上限 32 实例、seq 当前为消费者单点 INCR——这两条是水平扩展前的硬边界。单机 2 万连接已近 Docker/客户端自身 fd 上限时，把 client 拆到多机压。
 
 **回归护栏**：每次性能相关改动跑 30min 稳态对比基线 P99；`【警告】`（冷存冲突/收尾超时）必须为 0 条。
+
+## 数据治理与回归验证
+
+### 冷层瘦身 runbook（`message` 只写不删，练手栈 MySQL 卷会无声膨胀）
+
+```bash
+# ① 看规模（行数 + 磁盘占用）
+docker exec webapp-mysql-1 sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -N -e "SELECT COUNT(*) FROM ginchat.message; SELECT ROUND(SUM(data_length+index_length)/1073741824,2) FROM information_schema.tables WHERE table_schema=\"ginchat\" AND table_name=\"message\";"'
+# ② 只清冷归档（保用户/群/关系；seq 从 1 重计无害——热层键与门禁会随 TTL/修剪自然收敛）
+docker exec webapp-mysql-1 sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "TRUNCATE TABLE ginchat.message;"'
+# ③ 彻底重来（连卷带容器全拆，重启服务 AutoMigrate 重建表）
+docker-compose down -v
+```
+
+压测残留可先精准清：`DELETE FROM ginchat.message WHERE client_msg_id LIKE 'bench-%';`。TRUNCATE 与门禁/游标相互独立——清完最多加一条 `docker exec webapp-redis-1 redis-cli --scan --pattern 'cm:*' | xargs -r docker exec webapp-redis-1 redis-cli DEL` 的可选 tidy。知道刹车在哪，才敢一直踩油门。
+
+### 管线回归验证工装（改管线必跑）
+
+- **端到端**：`test/verify/`（常驻入库）——S1 私聊聚合、S2 小群扇出、S3 大群 Type=7+计算式未读、S4 多端扇出+心跳隔离踢线、S5/S6 clientMsgId 幂等与重放风暴。前置 env 与服务端同一组（见 `test/verify/main.go` 文件头），`go run ./test/verify`（`-clean` 清场；退出码非 0 = 有 FAIL，冲突取证看服务端日志「冲突样本」行）。
+- **纯逻辑单测**：`go test ./utils ./models ./middleware`——雪花唯一性/溢出换纪元/位段纯净、时间轮触发/续期/取消、convIdOf 归一化、落库前幂等对账 split、心跳键按设备隔离。
 
 ## 已知局限与后续规划
 

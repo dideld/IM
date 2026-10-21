@@ -11,11 +11,14 @@ Go 单体 Web IM（即时通讯）系统：Gin + gorilla/websocket 长连接，M
 ```bash
 go build .                      # 编译
 go run .                        # 本地运行，监听 0.0.0.0:8081
-docker-compose up --build       # 部署：nginx(:80，托管 /asset 并反代 WS) + go_app(:8081)
+go test ./utils ./models ./middleware   # 纯逻辑单测（雪花/时间轮/convIdOf/split/心跳隔离），无需中间件
+go vet ./...                    # 静态检查
+go run ./test/verify            # 管线端到端回归工装（需真实服务端+同组 env，见文件头；-clean 清场；退出码非0=有FAIL）
+docker-compose up --build       # 部署：MySQL+Redis+Kafka+go_app(:8081)+nginx(:80，托管 /asset 并反代 WS)；新 clone 先 copy .env.example .env
 go run test/bench_ws.go -mode echo -clients 5000 -wind 4   # WS 压测 v3（conn=长连接承载/echo=闭环自回显/ack=落库全链路，需 skipBenchPersist=false；前置 dev 开关 env 注入见文件头，勿在常驻配置里留着）
 ```
 
-- 本仓库没有 Go 单元测试（无 `_test.go`）。`test/` 目录下是 `package main` 的独立工具程序，用 `go run` 跑，不要用 `go test`。
+- 纯逻辑单测在各包内 `_test.go`（`go test` 跑）；`test/` 目录下仍是 `package main` 的独立工具程序（bench_ws、verify 工装），用 `go run` 跑，不要对整个 `test/` 目录 `go test`。
 - pprof 已注册：`/debug/pprof/*`。Swagger 注解写在 `service/` 各处理函数上，`docs/` 为 swag 生成物（改注解后用 `swag init` 重新生成）。
 
 ## 运行前提与配置坑
