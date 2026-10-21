@@ -1,16 +1,13 @@
-package models
-
-// 消费聚合器（批内 Redis 合并的执行端）：
-//   utils 消费者 → consumeCh → 聚合器（窗口攒批：门禁 HSetNX 合并 + 每会话 INCRBY 批量发号）
-//   → coldUnit → 冷 writer（落库成功→ 热层+门禁终值+未读 HINCRBY 单 Pipeline → 投递/ACK → 提交）。
+// Package models 消费聚合器（批内 Redis 合并的执行端）。
 //
-// 语义要点：
-//   - Redis 交互从"每条 4~5 次串行 RTT"降为"每批 2 次 + writer 1 次"，Docker NAT 环境下这是数量级收益；
-//   - seq 由聚合器唯一发号（INCRBY n 后按到达顺序分配 end-n+1..end），批内会话有序、跨批 FIFO 全局有序；
-//   - 门禁占位 "P" 提前到聚合器，终值 "seq:msgId" 挪到落库成功后与热层同 Pipeline 写——
-//     崩溃重放见 cm="P" 视为上次尝试死在中途，继续落库（uk_conv_cmid/uk_conv_seq 幂等兜底）；
-//   - 批处理失败（Redis 抖动）→ 有界重试后停摆等待（只出声不丢、不越序），停机信号下放弃该批（offset 未提交靠重启重放）；
-//   - 无效帧/压测旁路/重放补 ACK 的 offset 随所属 unit 一并提交（毒消息不占分区的语义保持）。
+//	链路：utils 消费者 → consumeCh → 聚合器（窗口攒批：门禁 HSetNX 合并 + 每会话 INCRBY 批量发号）
+//	→ coldUnit → 冷 writer（落库成功 → 热层+门禁终值+未读单 Pipeline → 投递/ACK → 提交）。
+//
+//	Redis 交互从"每条 4~5 次串行 RTT"降为"每批 2 次 + writer 1 次"。
+//	seq 由聚合器唯一发号，批内会话有序、跨批 FIFO 全局有序。
+//	门禁占位 "P" 提前到聚合器，终值 "seq:msgId" 在落库成功后与热层同 Pipeline 写入。
+//	批处理失败 → 有界重试后停摆等待；停机信号下放弃该批（未提交 offset 靠重启重放）。
+package models
 
 import (
 	"context"

@@ -6,17 +6,18 @@ import (
 	"gorm.io/gorm"
 )
 
+// Community 群聊。
 type Community struct {
 	gorm.Model
-	Name string
+	Name    string
 	OwnerId uint
-	Img string
-	Desc string
-
+	Img     string
+	Desc    string
 }
-func CreateCommunity(community Community) (int,string){
+
+// CreateCommunity 建群：校验非空 → 写群记录 → 建群关系（type=2），整包事务。
+func CreateCommunity(community Community) (int, string) {
 	tx := utils.DB.Begin()
-	//事务一旦开始，不论什么异常最终都会 Rollback
 	defer func() {
 		if r := recover(); r != nil {
 			tx.Rollback()
@@ -37,7 +38,7 @@ func CreateCommunity(community Community) (int,string){
 	contact := Contact{}
 	contact.OwnerId = community.OwnerId
 	contact.TargetId = community.ID
-	contact.Type = 2 //群关系
+	contact.Type = 2
 	if err := utils.DB.Create(&contact).Error; err != nil {
 		tx.Rollback()
 		return -1, "添加群关系失败"
@@ -47,29 +48,16 @@ func CreateCommunity(community Community) (int,string){
 	return 0, "建群成功"
 }
 
-// func LoadCommunity(ownerId uint)([] *Community,string){
-// 	data :=make([]*Community ,10)
-// 	utils.DB.Where("owner_id = ? ",ownerId).Find(&data)
-// 	for _,v:=range data{
-// 		fmt.Println(v)
-// 	}
-// 	return data,"查询成功"
-// }
+// LoadCommunity 查用户加入的全部群：先查 type=2 关系拿群 ID 列表，再批量查群记录。
 func LoadCommunity(ownerId uint) ([]*Community, string) {
 	contacts := make([]Contact, 0)
 	objIds := make([]uint64, 0)
-	utils.DB.Where("owner_id = ? and type= 2", ownerId).Find(&contacts)
+	utils.DB.Where("owner_id = ? and type = 2", ownerId).Find(&contacts)
 	for _, v := range contacts {
 		objIds = append(objIds, uint64(v.TargetId))
 	}
 
-	utils.Debug(context.Background(), "LoadCommunity objIds", "objIds", objIds)
-
 	data := make([]*Community, 0)
 	utils.DB.Where("id in ?", objIds).Find(&data)
-	for _, v := range data {
-		utils.Debug(context.Background(), "LoadCommunity result", "community", v)
-	}
-	//utils.DB.Where()
 	return data, "查询成功"
 }

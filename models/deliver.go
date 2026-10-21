@@ -1,10 +1,10 @@
+// Package models 落地扇出与生产侧韧性（store-and-forward 的"分发/通知/回执 + 背压"段）。
+//
+//	冷层写入成功后，一批消息在 landAndDeliver 内合并为"热层+门禁终值+未读"单 Pipeline，
+//	exec 成功后放大为收件人投递（扇出）、Type=4 未读事件（带权威计数）、发送者 Type=6 ACK。
+//	WS 侧不再直接投递，"先落盘再投递"的顺序闸门由聚合器→cold writer 保证。
+//	另有生产侧准入三态闸与应用层重投队列：同步投 Kafka 失败不立刻报错，重投超限才回 -1 ACK。
 package models
-
-// 落地扇出与生产侧韧性（store-and-forward 的"分发/通知/回执 + 背压"段）：
-//   冷层写入成功后，一批消息在 landAndDeliver 内合并为"热层+门禁终值+未读"单 Pipeline，
-//   exec 成功后放大为——收件人投递（扇出）、Type=4 未读事件（带权威计数）、发送者 Type=6 ACK。
-//   WS 侧不再直接投递，"先落盘再投递"的顺序闸门由 聚合器→cold writer 保证（见 consume.go/store.go）。
-//   另有生产侧准入三态闸与应用层重投队列：同步投 Kafka 失败不立刻报错，重投超限才回 -1 ACK。
 
 import (
 	"context"

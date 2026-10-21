@@ -1,10 +1,10 @@
+// Package utils 登录会话鉴权（Redis 会话 token）。
+//
+//	登录 → IssueToken 发随机 128bit token（login:token:{t}=userId，TTL 可配），
+//	同时登记到 login:user:{uid} 集合，支持改密/封禁时整户踢线。
+//	WS /chat 握手校验 ValidateToken，心跳 TouchToken 滑动续期。
+//	token 自身带 TTL 自然过期，集合仅服务于批量撤销，过期无害。
 package utils
-
-// 登录会话鉴权（Redis 会话 token）：
-//   登录 → IssueToken 发随机 128bit token（login:token:{t}=userId，TTL 可配），
-//   同时登记到 login:user:{uid} 集合，支持改密/封禁时整户踢线。
-//   WS /chat 握手校验 ValidateToken，心跳 TouchToken 滑动续期。
-//   token 自身带 TTL 自然过期，集合仅服务于批量撤销，过期无害。
 
 import (
 	"context"

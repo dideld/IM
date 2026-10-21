@@ -1,5 +1,12 @@
+// Package utils 业务错误码定义。
+//
+// 错误码分段：0=成功，1xxx=客户端参数/鉴权，2xxx=文件上传，3xxx=消息，5xxx=服务端内部。
+// 所有 API 响应统一通过 utils.RespOK / RespFail / RespList 携带错误码，
+// 禁止在 handler 内手写魔法数字。
+
 package utils
 
+// ErrCode 业务错误码，同时携带默认提示文案。
 type ErrCode struct {
 	Code    int
 	Message string

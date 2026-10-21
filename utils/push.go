@@ -1,10 +1,10 @@
+// Package utils 离线推送挂点（野火阶段预留位）。
+//
+//	Web IM 没有 APNs/FCM/厂商通道，只落"接口 + 挂点 + 开关"，不接运营商服务。
+//	离线消息到达补偿由"未读数 + unreadList/redisMsg 拉取"承担。
+//	PushAdapter 是预留门（短信/邮件/厂商 push 各自注册实现即可，不改主链路）。
+//	配置：push.enabled=true 且已注册适配器时才触发。
 package utils
-
-// 离线推送挂点（野火阶段模型里的"推送阶段"预留位）：
-//   Web IM 没有 APNs/FCM/厂商通道的凭证与常驻通知链路，本次只落"接口 + 挂点 + 开关"，
-//   不接运营商服务。离线消息的到达补偿仍由"未读数 + unreadList/redisMsg 拉取"承担，
-//   PushAdapter 只是未来多出来的一扇门（短信/邮件/厂商 push 各自注册实现即可，不改主链路）。
-//   配置：push.enabled=true 且已注册适配器时才会真正触发。
 
 import (
 	"context"

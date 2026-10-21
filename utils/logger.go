@@ -1,3 +1,8 @@
+// Package utils 结构化日志（基于 slog）与 GORM 日志适配器。
+//
+// 日志策略：仅记录异常与关键事件，正常请求零输出。
+// 日志自动携带 trace_id（从 context 提取）和 source（文件名:行号）。
+
 package utils
 
 import (
@@ -17,6 +22,7 @@ type ctxKey string
 
 const traceIDKey ctxKey = "trace_id"
 
+// InitLogger 初始化全局 slog 日志，level 支持 debug/info/warn/error。
 func InitLogger(level string) {
 	var lvl slog.Level
 	switch level {
@@ -35,6 +41,7 @@ func InitLogger(level string) {
 	}))
 }
 
+// WithTrace 将 trace_id 注入 context，后续日志自动携带。
 func WithTrace(ctx context.Context, traceID string) context.Context {
 	return context.WithValue(ctx, traceIDKey, traceID)
 }
@@ -53,6 +60,7 @@ func attrs(ctx context.Context, args []any) []any {
 	return args
 }
 
+// Info 记录信息级别日志（仅异常场景使用，正常流程不调用）。
 func Info(ctx context.Context, msg string, args ...any) {
 	if slogLogger == nil {
 		return
@@ -60,6 +68,7 @@ func Info(ctx context.Context, msg string, args ...any) {
 	slogLogger.InfoContext(ctx, msg, attrs(ctx, args)...)
 }
 
+// Warn 记录警告级别日志（参数错误、认证失败、慢 SQL 等）。
 func Warn(ctx context.Context, msg string, args ...any) {
 	if slogLogger == nil {
 		return
@@ -67,6 +76,7 @@ func Warn(ctx context.Context, msg string, args ...any) {
 	slogLogger.WarnContext(ctx, msg, attrs(ctx, args)...)
 }
 
+// Error 记录错误级别日志（DB/Redis/Kafka 故障、上传失败等）。
 func Error(ctx context.Context, msg string, args ...any) {
 	if slogLogger == nil {
 		return
@@ -74,6 +84,7 @@ func Error(ctx context.Context, msg string, args ...any) {
 	slogLogger.ErrorContext(ctx, msg, attrs(ctx, args)...)
 }
 
+// Debug 记录调试级别日志（开发环境使用）。
 func Debug(ctx context.Context, msg string, args ...any) {
 	if slogLogger == nil {
 		return
@@ -81,6 +92,7 @@ func Debug(ctx context.Context, msg string, args ...any) {
 	slogLogger.DebugContext(ctx, msg, attrs(ctx, args)...)
 }
 
+// Fatal 记录致命错误并退出进程（启动阶段使用）。
 func Fatal(ctx context.Context, msg string, args ...any) {
 	if slogLogger == nil {
 		slogLogger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -89,6 +101,7 @@ func Fatal(ctx context.Context, msg string, args ...any) {
 	os.Exit(1)
 }
 
+// gormSlogLogger GORM 日志适配器，将慢 SQL 和错误转为 slog 输出。
 type gormSlogLogger struct{}
 
 func (l *gormSlogLogger) Printf(format string, args ...interface{}) {}
@@ -127,16 +140,14 @@ func (l *gormSlogLogger) Trace(ctx context.Context, begin time.Time, fc func() (
 	args := []any{"sql", sql, "rows", rows, "elapsed", elapsed.String()}
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			slogLogger.DebugContext(ctx, "SQL记录未找到", args...)
+			slogLogger.DebugContext(ctx, "SQL 记录未找到", args...)
 			return
 		}
-		slogLogger.ErrorContext(ctx, "SQL错误", append(args, "error", err)...)
+		slogLogger.ErrorContext(ctx, "SQL 错误", append(args, "error", err)...)
 		return
 	}
 	if elapsed > time.Second {
-		slogLogger.WarnContext(ctx, "慢SQL", args...)
+		slogLogger.WarnContext(ctx, "慢 SQL", args...)
 		return
 	}
 }
-
-

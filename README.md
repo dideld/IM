@@ -175,14 +175,6 @@ docker-compose down -v
 
 ## 已知局限与后续规划
 
-已完成（P0）：WS 鉴权（Redis 会话 token）、雪花 workerId 配置化 + 主键冲突告警、优雅停机（冷队列排空）、上传白名单/大小校验。
-已完成（P1）：会话实体化（convId `p_`/`g_` 命名空间）、seq 双轨（排序/游标/未读）、群历史全员统一回读、未读红点+打开即已读+在线 Type=4 事件。
-
-已完成（P1.5）：HTTP 层鉴权（X-Token 会话身份 + ConvHasMember 成员校验，表单 userId 不再可信）、改密加盐哈希落库 + 全端踢线、401 统一跳登录、群历史下拉翻页。
-已完成（P2）：clientMsgId 幂等去重（Kafka 重放/客户端重发不落第二条）、多端在线（uid→设备列表扇出、同设备重连替换、背压只踢单端）、已读回执（Type=5 事件 + 气泡"已读"）、read_time 私聊回填、user_read_cursor 游标落库、压测方法论（见上节）。
-
-已完成（P3）：**先落盘再投递（store-and-forward）全链路可靠**——同步投 Kafka（错误可见）+ 手动提交 offset + 冷层写成功才放大分发（batch 攒批/inline 单条两档），Type=6 发送确认(ACK)帧 + 前端气泡 pending/超时重发/断线 onopen 补发，`cm:{convId}` HASH 幂等门禁（重放回补原 ACK），落库失败清标记+`msg:dlq` 死信+错误 ACK；**群聊逐条已读回执**（read_count 窗口逐条 +1 权威落库，Type=5 全员广播，前端"N 人已读"徽章）；离线推送**接口挂点**（utils/push.go PushAdapter + g_members 缓存 + Hub probe 在线判定；厂商通道未接，属运营商依赖暂缓项）；bench v3.1 `-mode ack` 全链路档。
-
 待做（按优先级）：
 
 - 水平扩展：跨节点消息路由（uid→节点路由表）+ seq 发号去单点假设；完成后才可多实例部署（workerId 上限 32）。落盘后置分发使**单分区消费者成为全链路吞吐上限**，扩分区/多消费者组应与此项一并规划

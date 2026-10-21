@@ -11,27 +11,29 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// GetUserList
-// @Tags 用户模块
-// @Summary 获取所有用户列表
-// @Produce json
-// @Success 200 {object} utils.Response
-// @Router /user/getUserList [post]
-// @Security X-Token
+// GetUserList 获取所有用户列表。
+//
+//	@Tags		用户模块
+//	@Summary	获取所有用户列表
+//	@Produce	json
+//	@Success	200 {object} utils.Response
+//	@Router		/user/getUserList [post]
+//	@Security	X-Token
 func GetUserList(c *gin.Context) {
 	data := models.GetUserList()
 	utils.RespOK(c, data, "获取用户列表成功")
 }
 
-// CreateUser
-// @Tags 用户模块
-// @Summary 注册新用户
-// @Produce json
-// @Param name formData string true "用户名"
-// @Param password formData string true "密码"
-// @Param Identity formData string true "确认密码"
-// @Success 200 {object} utils.Response
-// @Router /user/createUser [post]
+// CreateUser 注册新用户，校验参数后写入 DB。
+//
+//	@Tags		用户模块
+//	@Summary	注册新用户
+//	@Produce	json
+//	@Param		name		formData	string	true	"用户名"
+//	@Param		password	formData	string	true	"密码"
+//	@Param		Identity	formData	string	true	"确认密码"
+//	@Success	200 {object} utils.Response
+//	@Router		/user/createUser [post]
 func CreateUser(c *gin.Context) {
 	user := models.UserBasic{}
 	user.Name = c.Request.FormValue("name")
@@ -63,14 +65,15 @@ func CreateUser(c *gin.Context) {
 	utils.RespOK(c, user, "新增用户成功")
 }
 
-// DeleteUser
-// @Tags 用户模块
-// @Summary 删除用户（仅能删除自己）
-// @Produce json
-// @Param id query int true "用户ID"
-// @Success 200 {object} utils.Response
-// @Router /user/deleteUser [delete]
-// @Security X-Token
+// DeleteUser 删除用户（仅能删除自己）。
+//
+//	@Tags		用户模块
+//	@Summary	删除用户
+//	@Produce	json
+//	@Param		id	query	int	true	"用户ID"
+//	@Success	200 {object} utils.Response
+//	@Router		/user/deleteUser [delete]
+//	@Security	X-Token
 func DeleteUser(c *gin.Context) {
 	user := models.UserBasic{}
 	id, _ := strconv.Atoi(c.Query("id"))
@@ -83,19 +86,20 @@ func DeleteUser(c *gin.Context) {
 	utils.RespOK(c, user, "删除用户成功")
 }
 
-// UpdateUser
-// @Tags 用户模块
-// @Summary 修改用户资料
-// @Produce json
-// @Param id formData int true "用户ID"
-// @Param name formData string false "用户名"
-// @Param password formData string false "新密码"
-// @Param phone formData string false "手机号"
-// @Param icon formData string false "头像URL"
-// @Param email formData string false "邮箱"
-// @Success 200 {object} utils.Response
-// @Router /user/updateUser [post]
-// @Security X-Token
+// UpdateUser 修改用户资料（密码/手机/头像/邮箱）。
+//
+//	@Tags		用户模块
+//	@Summary	修改用户资料
+//	@Produce	json
+//	@Param		id			formData	int		true	"用户ID"
+//	@Param		name		formData	string	false	"用户名"
+//	@Param		password	formData	string	false	"新密码"
+//	@Param		phone		formData	string	false	"手机号"
+//	@Param		icon		formData	string	false	"头像URL"
+//	@Param		email		formData	string	false	"邮箱"
+//	@Success	200 {object} utils.Response
+//	@Router		/user/updateUser [post]
+//	@Security	X-Token
 func UpdateUser(c *gin.Context) {
 	user := models.UserBasic{}
 	id, _ := strconv.Atoi(c.PostForm("id"))
@@ -128,14 +132,15 @@ func UpdateUser(c *gin.Context) {
 	utils.RespOK(c, user, "修改用户成功")
 }
 
-// FindUserByNameAndPwd
-// @Tags 用户模块
-// @Summary 用户登录
-// @Produce json
-// @Param name formData string true "用户名"
-// @Param password formData string true "密码"
-// @Success 200 {object} utils.Response
-// @Router /user/findUserByNameAndPwd [post]
+// FindUserByNameAndPwd 用户登录，校验用户名和密码。
+//
+//	@Tags		用户模块
+//	@Summary	用户登录
+//	@Produce	json
+//	@Param		name		formData	string	true	"用户名"
+//	@Param		password	formData	string	true	"密码"
+//	@Success	200 {object} utils.Response
+//	@Router		/user/findUserByNameAndPwd [post]
 func FindUserByNameAndPwd(c *gin.Context) {
 	data := models.UserBasic{}
 	name := c.Request.FormValue("name")
@@ -157,19 +162,20 @@ func FindUserByNameAndPwd(c *gin.Context) {
 	utils.RespOK(c, data, "登录成功")
 }
 
-// RedisMsg
-// @Tags 消息模块
-// @Summary 读取热层消息（Redis缓存）
-// @Produce json
-// @Param convId formData string false "会话ID（私聊 p_{小}_{大}，群聊 g_{群id}）"
-// @Param userIdA formData int false "私聊用户A的ID（无convId时使用）"
-// @Param userIdB formData int false "私聊用户B的ID（无convId时使用）"
-// @Param start formData int false "起始位置"
-// @Param end formData int false "结束位置"
-// @Param isRev formData bool false "是否倒序"
-// @Success 200 {object} utils.Response
-// @Router /user/redisMsg [post]
-// @Security X-Token
+// RedisMsg 读取热层消息（Redis 缓存）。
+//
+//	@Tags		消息模块
+//	@Summary	读取热层消息
+//	@Produce	json
+//	@Param		convId	formData	string	false	"会话ID（私聊 p_{小}_{大}，群聊 g_{群id}）"
+//	@Param		userIdA	formData	int		false	"私聊用户A的ID（无convId时使用）"
+//	@Param		userIdB	formData	int		false	"私聊用户B的ID（无convId时使用）"
+//	@Param		start	formData	int		false	"起始位置"
+//	@Param		end		formData	int		false	"结束位置"
+//	@Param		isRev	formData	bool	false	"是否倒序"
+//	@Success	200 {object} utils.Response
+//	@Router		/user/redisMsg [post]
+//	@Security	X-Token
 func RedisMsg(c *gin.Context) {
 	convId := c.PostForm("convId")
 	userIdA, _ := strconv.Atoi(c.PostForm("userIdA"))
@@ -192,18 +198,19 @@ func RedisMsg(c *gin.Context) {
 	utils.RespList(c, res, len(res))
 }
 
-// HistoryMsg
-// @Tags 消息模块
-// @Summary 读取冷层历史消息（MySQL，游标分页）
-// @Produce json
-// @Param convId formData string false "会话ID"
-// @Param userIdA formData int false "私聊用户A的ID（无convId时使用）"
-// @Param userIdB formData int false "私聊用户B的ID（无convId时使用）"
-// @Param beforeSeq formData int false "游标：只取 seq 小于该值的消息，0=从最新开始"
-// @Param size formData int false "条数，默认20，最大100"
-// @Success 200 {object} utils.Response
-// @Router /user/historyMsg [post]
-// @Security X-Token
+// HistoryMsg 读取冷层历史消息（MySQL，游标分页）。
+//
+//	@Tags		消息模块
+//	@Summary	读取冷层历史消息
+//	@Produce	json
+//	@Param		convId	formData	string	false	"会话ID"
+//	@Param		userIdA	formData	int		false	"私聊用户A的ID（无convId时使用）"
+//	@Param		userIdB	formData	int		false	"私聊用户B的ID（无convId时使用）"
+//	@Param		beforeSeq	formData	int	false	"游标：只取 seq 小于该值的消息，0=从最新开始"
+//	@Param		size	formData	int	false	"条数，默认20，最大100"
+//	@Success	200 {object} utils.Response
+//	@Router		/user/historyMsg [post]
+//	@Security	X-Token
 func HistoryMsg(c *gin.Context) {
 	convId := c.PostForm("convId")
 	beforeSeq, _ := strconv.ParseInt(c.PostForm("beforeSeq"), 10, 64)
@@ -230,14 +237,15 @@ func HistoryMsg(c *gin.Context) {
 	utils.RespList(c, list, len(list))
 }
 
-// MarkRead
-// @Tags 消息模块
-// @Summary 标记会话已读（清未读并记录seq游标，群聊同时广播已读回执）
-// @Produce json
-// @Param convId formData string true "会话ID"
-// @Success 200 {object} utils.Response
-// @Router /user/markRead [post]
-// @Security X-Token
+// MarkRead 标记会话已读（清未读并记录 seq 游标，群聊同时广播已读回执）。
+//
+//	@Tags		消息模块
+//	@Summary	标记会话已读
+//	@Produce	json
+//	@Param		convId	formData	string	true	"会话ID"
+//	@Success	200 {object} utils.Response
+//	@Router		/user/markRead [post]
+//	@Security	X-Token
 func MarkRead(c *gin.Context) {
 	userId := authUid(c)
 	convId := c.PostForm("convId")
@@ -253,14 +261,15 @@ func MarkRead(c *gin.Context) {
 	utils.RespOK(c, nil, "已读")
 }
 
-// ReadStatus
-// @Tags 消息模块
-// @Summary 查询会话对端已读游标（私聊气泡"已读"状态）
-// @Produce json
-// @Param convId formData string true "会话ID"
-// @Success 200 {object} utils.Response
-// @Router /user/readStatus [post]
-// @Security X-Token
+// ReadStatus 查询会话对端已读游标（私聊气泡"已读"状态）。
+//
+//	@Tags		消息模块
+//	@Summary	查询对端已读游标
+//	@Produce	json
+//	@Param		convId	formData	string	true	"会话ID"
+//	@Success	200 {object} utils.Response
+//	@Router		/user/readStatus [post]
+//	@Security	X-Token
 func ReadStatus(c *gin.Context) {
 	convId := c.PostForm("convId")
 	if convId == "" || !models.ConvHasMember(convId, authUid(c)) {
@@ -270,37 +279,40 @@ func ReadStatus(c *gin.Context) {
 	utils.RespOK(c, gin.H{"convId": convId, "readSeq": models.PeerReadSeq(convId, authUid(c))}, "ok")
 }
 
-// UnreadList
-// @Tags 消息模块
-// @Summary 获取全部会话未读数
-// @Produce json
-// @Success 200 {object} utils.Response
-// @Router /user/unreadList [post]
-// @Security X-Token
+// UnreadList 获取全部会话未读数。
+//
+//	@Tags		消息模块
+//	@Summary	获取全部会话未读数
+//	@Produce	json
+//	@Success	200 {object} utils.Response
+//	@Router		/user/unreadList [post]
+//	@Security	X-Token
 func UnreadList(c *gin.Context) {
 	utils.RespOK(c, models.UnreadMap(authUid(c)), "ok")
 }
 
-// SearchFriends
-// @Tags 好友模块
-// @Summary 获取好友列表
-// @Produce json
-// @Success 200 {object} utils.Response
-// @Router /searchFriends [post]
-// @Security X-Token
+// SearchFriends 获取好友列表。
+//
+//	@Tags		好友模块
+//	@Summary	获取好友列表
+//	@Produce	json
+//	@Success	200 {object} utils.Response
+//	@Router		/searchFriends [post]
+//	@Security	X-Token
 func SearchFriends(c *gin.Context) {
 	users := models.SearchFriend(uint(authUid(c)))
 	utils.RespList(c, users, len(users))
 }
 
-// AddFriend
-// @Tags 好友模块
-// @Summary 添加好友
-// @Produce json
-// @Param targetId formData int true "目标用户ID"
-// @Success 200 {object} utils.Response
-// @Router /contact/addfriend [post]
-// @Security X-Token
+// AddFriend 添加好友。
+//
+//	@Tags		好友模块
+//	@Summary	添加好友
+//	@Produce	json
+//	@Param		targetId	formData	int	true	"目标用户ID"
+//	@Success	200 {object} utils.Response
+//	@Router		/contact/addfriend [post]
+//	@Security	X-Token
 func AddFriend(c *gin.Context) {
 	targetId, _ := strconv.Atoi(c.Request.FormValue("targetId"))
 	code := models.AddFriend(uint(authUid(c)), uint(targetId))
@@ -319,14 +331,15 @@ func AddFriend(c *gin.Context) {
 	}
 }
 
-// DeleteFriend
-// @Tags 好友模块
-// @Summary 删除好友
-// @Produce json
-// @Param targetId formData int true "目标用户ID"
-// @Success 200 {object} utils.Response
-// @Router /contact/deletefriend [post]
-// @Security X-Token
+// DeleteFriend 删除好友。
+//
+//	@Tags		好友模块
+//	@Summary	删除好友
+//	@Produce	json
+//	@Param		targetId	formData	int	true	"目标用户ID"
+//	@Success	200 {object} utils.Response
+//	@Router		/contact/deletefriend [post]
+//	@Security	X-Token
 func DeleteFriend(c *gin.Context) {
 	targetId, _ := strconv.Atoi(c.Request.FormValue("targetId"))
 	data, msg := models.DeleteFriend(uint(authUid(c)), uint(targetId))
@@ -337,29 +350,31 @@ func DeleteFriend(c *gin.Context) {
 	}
 }
 
-// LoadFriends
-// @Tags 好友模块
-// @Summary 加载好友列表
-// @Produce json
-// @Param userId query int true "用户ID"
-// @Success 200 {object} utils.Response
-// @Router /contact/loadfriends [get]
+// LoadFriends 加载好友列表。
+//
+//	@Tags		好友模块
+//	@Summary	加载好友列表
+//	@Produce	json
+//	@Param		userId	query	int	true	"用户ID"
+//	@Success	200 {object} utils.Response
+//	@Router		/contact/loadfriends [get]
 func LoadFriends(c *gin.Context) {
 	userId, _ := strconv.Atoi(c.Query("userId"))
 	data, _ := models.LoadFriends(uint(userId))
 	utils.RespList(c, data, len(data))
 }
 
-// CreateCommunity
-// @Tags 群模块
-// @Summary 创建群
-// @Produce json
-// @Param name formData string true "群名称"
-// @Param icon formData string false "群头像"
-// @Param desc formData string false "群描述"
-// @Success 200 {object} utils.Response
-// @Router /contact/createCommunity [post]
-// @Security X-Token
+// CreateCommunity 创建群。
+//
+//	@Tags		群模块
+//	@Summary	创建群
+//	@Produce	json
+//	@Param		name	formData	string	true	"群名称"
+//	@Param		icon	formData	string	false	"群头像"
+//	@Param		desc	formData	string	false	"群描述"
+//	@Success	200 {object} utils.Response
+//	@Router		/contact/createCommunity [post]
+//	@Security	X-Token
 func CreateCommunity(c *gin.Context) {
 	Name := c.Request.FormValue("name")
 	icon := c.Request.FormValue("icon")
@@ -377,26 +392,28 @@ func CreateCommunity(c *gin.Context) {
 	}
 }
 
-// LoadCommunity
-// @Tags 群模块
-// @Summary 获取群列表
-// @Produce json
-// @Success 200 {object} utils.Response
-// @Router /contact/loadCommunity [post]
-// @Security X-Token
+// LoadCommunity 获取群列表。
+//
+//	@Tags		群模块
+//	@Summary	获取群列表
+//	@Produce	json
+//	@Success	200 {object} utils.Response
+//	@Router		/contact/loadCommunity [post]
+//	@Security	X-Token
 func LoadCommunity(c *gin.Context) {
 	data, _ := models.LoadCommunity(uint(authUid(c)))
 	utils.RespList(c, data, len(data))
 }
 
-// JoinGroup
-// @Tags 群模块
-// @Summary 加入群
-// @Produce json
-// @Param comId formData string true "群ID或群名称"
-// @Success 200 {object} utils.Response
-// @Router /contact/joinGroup [post]
-// @Security X-Token
+// JoinGroup 加入群。
+//
+//	@Tags		群模块
+//	@Summary	加入群
+//	@Produce	json
+//	@Param		comId	formData	string	true	"群ID或群名称"
+//	@Success	200 {object} utils.Response
+//	@Router		/contact/joinGroup [post]
+//	@Security	X-Token
 func JoinGroup(c *gin.Context) {
 	comId := c.Request.FormValue("comId")
 	data, msg := models.JoinGroup(uint(authUid(c)), comId)

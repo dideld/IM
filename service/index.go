@@ -1,64 +1,35 @@
 package service
 
 import (
-	//"html/template"
-
 	"strconv"
 	"webapp/models"
-    //"fmt"
+
 	"github.com/gin-gonic/gin"
 )
 
-// GetIndex 首页（HTML 页面，非 API）
+// GetIndex 首页（渲染 HTML 页面）。
 func GetIndex(c *gin.Context) {
-    // ind,err:=template.ParseFiles("index.html")
-    // if err!=nil{
-    //     panic(err)
-    // }
-    // ind.Execute(c.Writer,"index")
-    c.HTML(200, "login.html", nil)
-
-}
-func ToRegister(c *gin.Context){
-    // ind,err:=template.ParseFiles("views/user/register.html")
-    // if err!=nil{
-    //     panic(err)
-    // }
-    // ind.Execute(c.Writer,"register")
-     c.HTML(200, "register.html", "register")
+	c.HTML(200, "login.html", nil)
 }
 
-func ToChat(c *gin.Context){
-//     ind,err:=template.ParseFiles("views/chat/index.html",
-//         "views/chat/head.html",
-//         "views/chat/foot.html",
-//         "views/chat/tabmenu.html",
-//         "views/chat/concat.html",
-//         "views/chat/group.html",
-//         "views/chat/profile.html",
-//         "views/chat/main.html",
-
-// )
-//     if err!=nil{
-//         panic(err)
-//     }
-//     userId,_:=strconv.Atoi(c.Query("userId"))
-//     token:=c.Query("token")
-//     user:=models.UserBasic{}
-//     user.ID=uint(userId)
-//     user.Identity=token
-//     fmt.Println("Tochat__________",user)
-//     ind.Execute(c.Writer,user)
-     userId, _ := strconv.Atoi(c.Query("userId"))
-    token := c.Query("token")
-
-    user := models.UserBasic{}
-    user.ID = uint(userId)
-    user.Identity = token
-
-
-    c.HTML(200, "chat/index.html", user)
+// ToRegister 注册页面。
+func ToRegister(c *gin.Context) {
+	c.HTML(200, "register.html", "register")
 }
-func Chat(c *gin.Context ){
-    models.Chat(c.Writer,c.Request)
+
+// ToChat 聊天页面入口。
+func ToChat(c *gin.Context) {
+	userId, _ := strconv.Atoi(c.Query("userId"))
+	token := c.Query("token")
+
+	user := models.UserBasic{}
+	user.ID = uint(userId)
+	user.Identity = token
+
+	c.HTML(200, "chat/index.html", user)
+}
+
+// Chat WebSocket 连接入口（Upgrade 前在 models.Chat 内自行校验 token）。
+func Chat(c *gin.Context) {
+	models.Chat(c.Writer, c.Request)
 }

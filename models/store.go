@@ -1,17 +1,14 @@
+// Package models 消息冷热存储与会话状态层（先落盘、后投递——store-and-forward）。
+//
+//	会话 convId：私聊 "p_{小id}_{大id}"、群聊 "g_{群id}"（convIdOf 是唯一来源）。
+//	热层 = Redis ZSet（score = 会话级递增 seq，单会话修剪 + 滑动 TTL）。
+//	冷层 = MySQL message 表（主键 id = 雪花 msgId，(conv_key, seq) 唯一，游标分页）。
+//	未读 = Redis HASH unread:{uid}（field=convId）。
+//	去重 = Redis HASH cm:{convId}（HSetNX 做幂等门禁，重放命中回补 ACK 而不重复落库）。
+//	死信 = Redis LIST msg:dlq（落库失败原文留证，封顶 500）。
+//	群成员缓存 = Redis SET g_members:{gid}。
+//	投递与 ACK 在冷层写入成功后由 landAndDeliver 放大（batch/inline 共用同一闸门）。
 package models
-
-// 消息冷热存储与会话状态层（先落盘、后投递——store-and-forward）：
-//   会话 convId：私聊 "p_{小id}_{大id}"、群聊 "g_{群id}"（convIdOf 是唯一来源），
-//   热层/冷层/未读数/事件推送共用，杜绝用户id与群id串号。
-//   热层 = Redis ZSet（score = 会话级递增 seq，单会话修剪 + 滑动 TTL）
-//   冷层 = MySQL message 表（主键 id = 雪花 msgId，(conv_key, seq) 唯一，游标分页）
-//   未读 = Redis HASH unread:{uid}（field=convId）
-//   去重 = Redis HASH cm:{convId}（field=clientMsgId，value="P"→"seq:msgId"；HSetNX 做幂等门禁，
-//          重放命中回补 ACK 而不重复落库；失败路径 HDEL 允许重新落库）
-//   死信 = Redis LIST msg:dlq（落库失败原文留证，封顶 500）
-//   群成员缓存 = Redis SET g_members:{gid}（消费者热路径每条必查，见 deliver.go）
-//   投递与 ACK 一律在冷层写入成功后由 deliverLanded 放大（batch 攒批 / inline 单条立即写，
-//   storage.coldMode 只是节奏差异，"冷层成功才投递"的闸门两种模式相同）。
 
 import (
 	"context"
